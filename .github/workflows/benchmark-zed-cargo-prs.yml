@@ -5,6 +5,9 @@ on:
   push:
     branches:
       - bench/zed-cargo-prs
+  pull_request:
+    branches:
+      - master
 
 permissions:
   contents: read
@@ -139,7 +142,6 @@ jobs:
                   env["CARGO_TARGET_DIR"] = str(target)
                   env["CARGO_HOME"] = str(home)
                   env["CARGO_NET_OFFLINE"] = "true"
-                  # Keep registry/git caches available without sharing workspace build state.
                   for child in ("registry", "git"):
                       source = Path.home() / ".cargo" / child
                       dest = home / child
