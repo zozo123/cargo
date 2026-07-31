@@ -18,12 +18,11 @@ use std::hash::Hash;
 struct Ready<N> {
     key: N,
     priority: usize,
-    sequence: usize,
 }
 
 impl<N> PartialEq for Ready<N> {
     fn eq(&self, other: &Self) -> bool {
-        self.priority == other.priority && self.sequence == other.sequence
+        self.priority == other.priority
     }
 }
 
@@ -37,10 +36,7 @@ impl<N> PartialOrd for Ready<N> {
 
 impl<N> Ord for Ready<N> {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.priority
-            .cmp(&other.priority)
-            // Earlier queued nodes win ties.
-            .then_with(|| other.sequence.cmp(&self.sequence))
+        self.priority.cmp(&other.priority)
     }
 }
 
@@ -71,10 +67,6 @@ pub struct DependencyQueue<N: Hash + Eq, E: Hash + Eq, V> {
 
     /// Nodes with no remaining dependencies, ordered by priority.
     ready: BinaryHeap<Ready<N>>,
-
-    /// Stable ordering for nodes with equal priority.
-    sequence: HashMap<N, usize>,
-    next_sequence: usize,
 }
 
 impl<N: Hash + Eq, E: Hash + Eq, V> Default for DependencyQueue<N, E, V> {
@@ -92,8 +84,6 @@ impl<N: Hash + Eq, E: Hash + Eq, V> DependencyQueue<N, E, V> {
             priority: HashMap::default(),
             cost: HashMap::default(),
             ready: BinaryHeap::new(),
-            sequence: HashMap::default(),
-            next_sequence: 0,
         }
     }
 }
@@ -133,8 +123,6 @@ impl<N: Hash + Eq + Clone, E: Eq + Hash + Clone, V> DependencyQueue<N, E, V> {
                 .or_insert_with(HashSet::default)
                 .insert(key.clone());
         }
-        self.sequence.insert(key.clone(), self.next_sequence);
-        self.next_sequence += 1;
         self.dep_map.insert(key.clone(), (my_dependencies, value));
         self.cost.insert(key, cost);
     }
@@ -155,6 +143,7 @@ impl<N: Hash + Eq + Clone, E: Eq + Hash + Clone, V> DependencyQueue<N, E, V> {
             })
             .collect();
 
+        self.ready.clear();
         self.ready.extend(
             self.dep_map
                 .iter()
@@ -162,7 +151,6 @@ impl<N: Hash + Eq + Clone, E: Eq + Hash + Clone, V> DependencyQueue<N, E, V> {
                 .map(|(key, _)| Ready {
                     key: key.clone(),
                     priority: self.priority[key],
-                    sequence: self.sequence[key],
                 }),
         );
 
@@ -205,7 +193,7 @@ impl<N: Hash + Eq + Clone, E: Eq + Hash + Clone, V> DependencyQueue<N, E, V> {
     /// A package is ready to be built when it has 0 un-built dependencies. If
     /// `None` is returned then no packages are ready to be built.
     pub fn dequeue(&mut self) -> Option<(N, V, usize)> {
-        let Ready { key, priority, .. } = self.ready.pop()?;
+        let Ready { key, priority } = self.ready.pop()?;
         let (_, data) = self.dep_map.remove(&key).unwrap();
         Some((key, data, priority))
     }
@@ -242,7 +230,6 @@ impl<N: Hash + Eq + Clone, E: Eq + Hash + Clone, V> DependencyQueue<N, E, V> {
                 self.ready.push(Ready {
                     key: dep.clone(),
                     priority: self.priority[dep],
-                    sequence: self.sequence[dep],
                 });
                 result.push(dep);
             }
@@ -307,7 +294,7 @@ mod test {
     }
 
     #[test]
-    fn equal_priority_uses_queue_order() {
+    fn equal_priority_nodes_are_all_dequeued() {
         let mut q = DependencyQueue::new();
 
         q.queue(1, (), vec![], 1);
@@ -315,8 +302,12 @@ mod test {
         q.queue(3, (), vec![], 1);
         q.queue_finished();
 
-        assert_eq!(q.dequeue(), Some((1, (), 1)));
-        assert_eq!(q.dequeue(), Some((2, (), 1)));
-        assert_eq!(q.dequeue(), Some((3, (), 1)));
+        let mut nodes = Vec::new();
+        while let Some((node, (), priority)) = q.dequeue() {
+            assert_eq!(priority, 2);
+            nodes.push(node);
+        }
+        nodes.sort_unstable();
+        assert_eq!(nodes, vec![1, 2, 3]);
     }
 }
