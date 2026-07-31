@@ -1,1 +1,3 @@
 Build Cargo base 8ea62e927ca2875b7839b8c5110f3e4fdfdf58c3 and fixed Cargo b1941b55d1b1a311c6a20b93ada622267c3d35b3, then benchmark both on Zed 5e03f2d387e629237c10a4e4fed881b64abd8fea.
+
+Retry 2: pass -Z unstable-options for the unit graph characterization.
