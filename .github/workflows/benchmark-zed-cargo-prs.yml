@@ -1,3 +1,4 @@
+# Temporary benchmark-only workflow; do not merge.
 name: Benchmark Cargo PRs on Zed
 
 on:
