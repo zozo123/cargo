@@ -1418,6 +1418,11 @@ pub trait TestEnvCommandExt: Sized {
             .env("HOME", paths::home())
             .env("CARGO_HOME", paths::cargo_home())
             .env("__CARGO_TEST_ROOT", paths::global_root())
+            // Reuse successful rustc version probes across isolated tests.
+            .env(
+                "__CARGO_TEST_RUSTC_INFO_CACHE",
+                paths::global_root().join("rustc-info-cache"),
+            )
             // Force Cargo to think it's on the stable channel for all tests, this
             // should hopefully not surprise us as we add cargo features over time and
             // cargo rides the trains.

@@ -1,6 +1,7 @@
 //! Tests for the cache file for the rustc version info.
 
 use std::env;
+use std::fs;
 
 use crate::prelude::*;
 use cargo_test_support::basic_bin_manifest;
@@ -9,15 +10,18 @@ use cargo_test_support::{basic_manifest, project};
 const MISS: &str = "[..] rustc info cache miss[..]";
 const HIT: &str = "[..]rustc info cache hit[..]";
 const UPDATE: &str = "[..]updated rustc info cache[..]";
+const SHARED: &str = "[..]shared rustc probe cache[..]";
 
 #[cargo_test]
 fn rustc_info_cache() {
     let p = project()
         .file("src/main.rs", r#"fn main() { println!("hello"); }"#)
         .build();
+    let shared_cache = p.root().join("shared-rustc-info-cache");
 
     p.cargo("build")
         .env("CARGO_LOG", "cargo::util::rustc=debug")
+        .env("__CARGO_TEST_RUSTC_INFO_CACHE", &shared_cache)
         .with_stderr_contains("[..]failed to read rustc info cache[..]")
         .with_stderr_contains(MISS)
         .with_stderr_does_not_contain(HIT)
@@ -26,6 +30,7 @@ fn rustc_info_cache() {
 
     p.cargo("build")
         .env("CARGO_LOG", "cargo::util::rustc=debug")
+        .env("__CARGO_TEST_RUSTC_INFO_CACHE", &shared_cache)
         .with_stderr_contains("[..]reusing existing rustc info cache[..]")
         .with_stderr_contains(HIT)
         .with_stderr_does_not_contain(MISS)
@@ -35,6 +40,7 @@ fn rustc_info_cache() {
     p.cargo("build")
         .env("CARGO_LOG", "cargo::util::rustc=debug")
         .env("CARGO_CACHE_RUSTC_INFO", "0")
+        .env("__CARGO_TEST_RUSTC_INFO_CACHE", &shared_cache)
         .with_stderr_contains("[..]rustc info cache disabled[..]")
         .with_stderr_does_not_contain(UPDATE)
         .run();
@@ -69,18 +75,22 @@ fn rustc_info_cache() {
     p.cargo("build")
         .env("CARGO_LOG", "cargo::util::rustc=debug")
         .env("RUSTC", other_rustc.display().to_string())
+        .env("__CARGO_TEST_RUSTC_INFO_CACHE", &shared_cache)
         .with_stderr_contains("[..]different compiler, creating new rustc info cache[..]")
         .with_stderr_contains(MISS)
         .with_stderr_does_not_contain(HIT)
+        .with_stderr_does_not_contain(SHARED)
         .with_stderr_contains(UPDATE)
         .run();
 
     p.cargo("build")
         .env("CARGO_LOG", "cargo::util::rustc=debug")
         .env("RUSTC", other_rustc.display().to_string())
+        .env("__CARGO_TEST_RUSTC_INFO_CACHE", &shared_cache)
         .with_stderr_contains("[..]reusing existing rustc info cache[..]")
         .with_stderr_contains(HIT)
         .with_stderr_does_not_contain(MISS)
+        .with_stderr_does_not_contain(SHARED)
         .with_stderr_does_not_contain(UPDATE)
         .run();
 
@@ -89,19 +99,57 @@ fn rustc_info_cache() {
     p.cargo("build")
         .env("CARGO_LOG", "cargo::util::rustc=debug")
         .env("RUSTC", other_rustc.display().to_string())
+        .env("__CARGO_TEST_RUSTC_INFO_CACHE", &shared_cache)
         .with_stderr_contains("[..]different compiler, creating new rustc info cache[..]")
         .with_stderr_contains(MISS)
         .with_stderr_does_not_contain(HIT)
+        .with_stderr_does_not_contain(SHARED)
         .with_stderr_contains(UPDATE)
         .run();
 
     p.cargo("build")
         .env("CARGO_LOG", "cargo::util::rustc=debug")
         .env("RUSTC", other_rustc.display().to_string())
+        .env("__CARGO_TEST_RUSTC_INFO_CACHE", &shared_cache)
         .with_stderr_contains("[..]reusing existing rustc info cache[..]")
         .with_stderr_contains(HIT)
         .with_stderr_does_not_contain(MISS)
+        .with_stderr_does_not_contain(SHARED)
         .with_stderr_does_not_contain(UPDATE)
+        .run();
+}
+
+#[cargo_test]
+fn rustc_info_cache_shared_between_workspaces() {
+    let p = project()
+        .no_manifest()
+        .file("a/Cargo.toml", &basic_manifest("a", "0.1.0"))
+        .file("a/src/lib.rs", "")
+        .file("b/Cargo.toml", &basic_manifest("b", "0.1.0"))
+        .file("b/src/lib.rs", "")
+        .build();
+    let shared_cache = p.root().join("shared-rustc-info-cache");
+
+    p.cargo("check")
+        .cwd("a")
+        .env("CARGO_LOG", "cargo::util::rustc=debug")
+        .env("__CARGO_TEST_RUSTC_INFO_CACHE", &shared_cache)
+        .with_stderr_contains("[..]shared rustc probe cache miss[..]")
+        .with_stderr_contains("[..]updated shared rustc probe cache[..]")
+        .run();
+
+    let compiler_caches = fs::read_dir(shared_cache.join("v1")).unwrap();
+    let cache_files = compiler_caches
+        .flat_map(|entry| fs::read_dir(entry.unwrap().path()).unwrap())
+        .count();
+    assert_eq!(cache_files, 1, "only `rustc -vV` should be shared");
+
+    p.cargo("check")
+        .cwd("b")
+        .env("CARGO_LOG", "cargo::util::rustc=debug")
+        .env("__CARGO_TEST_RUSTC_INFO_CACHE", &shared_cache)
+        .with_stderr_contains("[..]shared rustc probe cache hit[..]")
+        .with_stderr_does_not_contain("[..]running `rustc -vV`[..]")
         .run();
 }
 
@@ -151,6 +199,7 @@ fn rustc_info_cache_with_wrappers() {
             .with_stderr_contains(MISS)
             .with_stderr_contains(UPDATE)
             .with_stderr_does_not_contain(HIT)
+            .with_stderr_does_not_contain(SHARED)
             .with_status(0)
             .run();
         p.cargo("build")
@@ -160,6 +209,7 @@ fn rustc_info_cache_with_wrappers() {
             .with_stderr_contains(HIT)
             .with_stderr_does_not_contain(UPDATE)
             .with_stderr_does_not_contain(MISS)
+            .with_stderr_does_not_contain(SHARED)
             .with_status(0)
             .run();
 
@@ -173,6 +223,7 @@ fn rustc_info_cache_with_wrappers() {
             .with_stderr_contains(MISS)
             .with_stderr_contains(UPDATE)
             .with_stderr_does_not_contain(HIT)
+            .with_stderr_does_not_contain(SHARED)
             .with_status(101)
             .run();
         p.cargo("build")
@@ -182,6 +233,7 @@ fn rustc_info_cache_with_wrappers() {
             .with_stderr_contains(HIT)
             .with_stderr_does_not_contain(UPDATE)
             .with_stderr_does_not_contain(MISS)
+            .with_stderr_does_not_contain(SHARED)
             .with_status(101)
             .run();
     }

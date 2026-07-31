@@ -519,8 +519,20 @@ impl GlobalContext {
 
     /// Gets the path to the `rustc` executable.
     pub fn load_global_rustc(&self, ws: Option<&Workspace<'_>>) -> CargoResult<Rustc> {
-        let cache_location =
-            ws.map(|ws| ws.build_dir().join(".rustc_info.json").into_path_unlocked());
+        let cache_location = if self.cache_rustc_info {
+            ws.map(|ws| ws.build_dir().join(".rustc_info.json").into_path_unlocked())
+        } else {
+            None
+        };
+        let shared_cache_location = if self.cache_rustc_info {
+            Some(
+                self.get_env_os("__CARGO_TEST_RUSTC_INFO_CACHE")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| self.home().join(".rustc_info_cache").into_path_unlocked()),
+            )
+        } else {
+            None
+        };
         let wrapper = self.maybe_get_tool("rustc_wrapper", &self.build_config()?.rustc_wrapper);
         let rustc_workspace_wrapper = self.maybe_get_tool(
             "rustc_workspace_wrapper",
@@ -537,11 +549,8 @@ impl GlobalContext {
                 .join("rustc")
                 .into_path_unlocked()
                 .with_extension(env::consts::EXE_EXTENSION),
-            if self.cache_rustc_info {
-                cache_location
-            } else {
-                None
-            },
+            cache_location,
+            shared_cache_location,
             self,
         )
     }

@@ -48,6 +48,7 @@ impl Rustc {
         workspace_wrapper: Option<PathBuf>,
         rustup_rustc: &Path,
         cache_location: Option<PathBuf>,
+        shared_cache_location: Option<PathBuf>,
         gctx: &GlobalContext,
     ) -> CargoResult<Rustc> {
         let mut cache = Cache::load(
@@ -56,6 +57,7 @@ impl Rustc {
             &path,
             rustup_rustc,
             cache_location,
+            shared_cache_location,
             gctx,
         );
 
@@ -65,7 +67,8 @@ impl Rustc {
         apply_env_config(gctx, &mut cmd)?;
         cmd.env(crate::CARGO_ENV, gctx.cargo_exe()?);
         cmd.arg("-vV");
-        let verbose_version = cache.cached_output(&cmd, 0)?.0;
+        // Unlike target-info probes, this output cannot depend on workspace-relative flags.
+        let verbose_version = cache.cached_output(&cmd, 0, true)?.0;
 
         let extract = |field: &str| -> CargoResult<&str> {
             verbose_version
@@ -157,7 +160,7 @@ impl Rustc {
         self.cache
             .lock()
             .unwrap()
-            .cached_output(cmd, extra_fingerprint)
+            .cached_output(cmd, extra_fingerprint, false)
     }
 }
 
@@ -172,8 +175,15 @@ impl Rustc {
 #[derive(Debug)]
 struct Cache {
     cache_location: Option<PathBuf>,
+    shared: Option<SharedCache>,
     dirty: bool,
     data: CacheData,
+}
+
+#[derive(Debug)]
+struct SharedCache {
+    root: PathBuf,
+    rustc_fingerprint: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -199,37 +209,45 @@ impl Cache {
         rustc: &Path,
         rustup_rustc: &Path,
         cache_location: Option<PathBuf>,
+        shared_cache_location: Option<PathBuf>,
         gctx: &GlobalContext,
     ) -> Cache {
-        match (
-            cache_location,
-            rustc_fingerprint(wrapper, workspace_wrapper, rustc, rustup_rustc, gctx),
-        ) {
-            (Some(cache_location), Ok(rustc_fingerprint)) => {
+        match rustc_fingerprint(wrapper, workspace_wrapper, rustc, rustup_rustc, gctx) {
+            Ok(fingerprint) if cache_location.is_some() || shared_cache_location.is_some() => {
+                let shared = shared_cache_location
+                    .filter(|_| fingerprint.shareable)
+                    .map(|root| SharedCache {
+                        root,
+                        rustc_fingerprint: fingerprint.hash,
+                    });
                 let empty = CacheData {
-                    rustc_fingerprint,
+                    rustc_fingerprint: fingerprint.hash,
                     outputs: HashMap::default(),
                     successes: HashMap::default(),
                 };
                 let mut dirty = true;
-                let data = match read(&cache_location) {
-                    Ok(data) => {
-                        if data.rustc_fingerprint == rustc_fingerprint {
-                            debug!("reusing existing rustc info cache");
-                            dirty = false;
-                            data
-                        } else {
-                            debug!("different compiler, creating new rustc info cache");
+                let data = match cache_location.as_deref() {
+                    Some(cache_location) => match read(cache_location) {
+                        Ok(data) => {
+                            if data.rustc_fingerprint == fingerprint.hash {
+                                debug!("reusing existing rustc info cache");
+                                dirty = false;
+                                data
+                            } else {
+                                debug!("different compiler, creating new rustc info cache");
+                                empty
+                            }
+                        }
+                        Err(e) => {
+                            debug!("failed to read rustc info cache: {}", e);
                             empty
                         }
-                    }
-                    Err(e) => {
-                        debug!("failed to read rustc info cache: {}", e);
-                        empty
-                    }
+                    },
+                    None => empty,
                 };
                 return Cache {
-                    cache_location: Some(cache_location),
+                    cache_location,
+                    shared,
                     dirty,
                     data,
                 };
@@ -239,13 +257,14 @@ impl Cache {
                     Ok(serde_json::from_str(&json)?)
                 }
             }
-            (_, fingerprint) => {
+            fingerprint => {
                 if let Err(e) = fingerprint {
                     warn!("failed to calculate rustc fingerprint: {}", e);
                 }
                 debug!("rustc info cache disabled");
                 Cache {
                     cache_location: None,
+                    shared: None,
                     dirty: false,
                     data: CacheData::default(),
                 }
@@ -257,29 +276,48 @@ impl Cache {
         &mut self,
         cmd: &ProcessBuilder,
         extra_fingerprint: u64,
+        use_shared: bool,
     ) -> CargoResult<(String, String)> {
         let key = process_fingerprint(cmd, extra_fingerprint);
         if let std::collections::hash_map::Entry::Vacant(e) = self.data.outputs.entry(key) {
-            debug!("rustc info cache miss");
-            debug!("running {}", cmd);
-            let output = cmd.output()?;
-            let stdout = String::from_utf8(output.stdout)
-                .map_err(|e| anyhow::anyhow!("{}: {:?}", e, e.as_bytes()))
-                .with_context(|| format!("`{}` didn't return utf8 output", cmd))?;
-            let stderr = String::from_utf8(output.stderr)
-                .map_err(|e| anyhow::anyhow!("{}: {:?}", e, e.as_bytes()))
-                .with_context(|| format!("`{}` didn't return utf8 output", cmd))?;
-            e.insert(Output {
-                success: output.status.success(),
-                status: if output.status.success() {
-                    String::new()
-                } else {
-                    cargo_util::exit_status_to_string(output.status)
-                },
-                code: output.status.code(),
-                stdout,
-                stderr,
-            });
+            let shared_output = if use_shared {
+                self.shared.as_ref().and_then(|shared| shared.read(key))
+            } else {
+                None
+            };
+            let (output, cache_shared) = if let Some(output) = shared_output {
+                (output, false)
+            } else {
+                debug!("rustc info cache miss");
+                debug!("running {}", cmd);
+                let output = cmd.output()?;
+                let stdout = String::from_utf8(output.stdout)
+                    .map_err(|e| anyhow::anyhow!("{}: {:?}", e, e.as_bytes()))
+                    .with_context(|| format!("`{}` didn't return utf8 output", cmd))?;
+                let stderr = String::from_utf8(output.stderr)
+                    .map_err(|e| anyhow::anyhow!("{}: {:?}", e, e.as_bytes()))
+                    .with_context(|| format!("`{}` didn't return utf8 output", cmd))?;
+                (
+                    Output {
+                        success: output.status.success(),
+                        status: if output.status.success() {
+                            String::new()
+                        } else {
+                            cargo_util::exit_status_to_string(output.status)
+                        },
+                        code: output.status.code(),
+                        stdout,
+                        stderr,
+                    },
+                    use_shared,
+                )
+            };
+            if cache_shared && output.success {
+                if let Some(shared) = &self.shared {
+                    shared.write(key, &output);
+                }
+            }
+            e.insert(output);
             self.dirty = true;
         } else {
             debug!("rustc info cache hit");
@@ -300,6 +338,47 @@ impl Cache {
     }
 }
 
+impl SharedCache {
+    fn path(&self, key: u64) -> PathBuf {
+        self.root
+            .join("v1")
+            .join(format!("{:016x}", self.rustc_fingerprint))
+            .join(format!("{key:016x}.json"))
+    }
+
+    fn read(&self, key: u64) -> Option<Output> {
+        let path = self.path(key);
+        match paths::read(&path).and_then(|json| Ok(serde_json::from_str(&json)?)) {
+            Ok(output @ Output { success: true, .. }) => {
+                debug!("shared rustc probe cache hit");
+                Some(output)
+            }
+            Ok(_) => {
+                debug!("ignoring failed output in shared rustc probe cache");
+                None
+            }
+            Err(e) => {
+                debug!("shared rustc probe cache miss: {}", e);
+                None
+            }
+        }
+    }
+
+    fn write(&self, key: u64, output: &Output) {
+        debug_assert!(output.success);
+        let path = self.path(key);
+        let result = (|| -> CargoResult<()> {
+            paths::create_dir_all(path.parent().unwrap())?;
+            let json = serde_json::to_string(output)?;
+            paths::write_atomic(&path, json)
+        })();
+        match result {
+            Ok(()) => info!("updated shared rustc probe cache"),
+            Err(e) => warn!("failed to update shared rustc probe cache: {}", e),
+        }
+    }
+}
+
 impl Drop for Cache {
     fn drop(&mut self) {
         if !self.dirty {
@@ -315,13 +394,18 @@ impl Drop for Cache {
     }
 }
 
+struct RustcFingerprint {
+    hash: u64,
+    shareable: bool,
+}
+
 fn rustc_fingerprint(
     wrapper: Option<&Path>,
     workspace_wrapper: Option<&Path>,
     rustc: &Path,
     rustup_rustc: &Path,
     gctx: &GlobalContext,
-) -> CargoResult<u64> {
+) -> CargoResult<RustcFingerprint> {
     let mut hasher = StableHasher::new();
 
     let hash_exe = |hasher: &mut _, path| -> CargoResult<()> {
@@ -357,7 +441,9 @@ fn rustc_fingerprint(
     //
     // If we don't see rustup env vars, but it looks like the compiler
     // is managed by rustup, we conservatively bail out.
-    let maybe_rustup = rustup_rustc == rustc;
+    let resolved_rustc = paths::resolve_executable(rustc)?;
+    let maybe_rustup = rustup_rustc == resolved_rustc;
+    let mut shareable = false;
     match (
         maybe_rustup,
         gctx.get_env("RUSTUP_HOME"),
@@ -374,12 +460,18 @@ fn rustc_fingerprint(
                 .join("rustc")
                 .with_extension(env::consts::EXE_EXTENSION);
             paths::mtime(&real_rustc)?.hash(&mut hasher);
+            shareable = wrapper.is_none()
+                && workspace_wrapper.is_none()
+                && (maybe_rustup || resolved_rustc == real_rustc);
         }
         (true, _, _) => anyhow::bail!("probably rustup rustc, but without rustup's env vars"),
         _ => (),
     }
 
-    Ok(Hasher::finish(&hasher))
+    Ok(RustcFingerprint {
+        hash: Hasher::finish(&hasher),
+        shareable,
+    })
 }
 
 fn process_fingerprint(cmd: &ProcessBuilder, extra_fingerprint: u64) -> u64 {
@@ -390,4 +482,67 @@ fn process_fingerprint(cmd: &ProcessBuilder, extra_fingerprint: u64) -> u64 {
     env.sort_unstable();
     env.hash(&mut hasher);
     Hasher::finish(&hasher)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Output, SharedCache};
+
+    #[test]
+    fn shared_cache_ignores_failed_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = SharedCache {
+            root: temp.path().to_owned(),
+            rustc_fingerprint: 1,
+        };
+        let path = cache.path(2);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            serde_json::to_string(&Output {
+                success: false,
+                status: "exit status: 1".into(),
+                code: Some(1),
+                stdout: String::new(),
+                stderr: "transient failure".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(cache.read(2).is_none());
+    }
+
+    #[test]
+    fn shared_cache_concurrent_writes_are_valid() {
+        let temp = tempfile::tempdir().unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    SharedCache {
+                        root: temp.path().to_owned(),
+                        rustc_fingerprint: 1,
+                    }
+                    .write(
+                        2,
+                        &Output {
+                            success: true,
+                            status: String::new(),
+                            code: Some(0),
+                            stdout: "rustc output".into(),
+                            stderr: String::new(),
+                        },
+                    );
+                });
+            }
+        });
+
+        let output = SharedCache {
+            root: temp.path().to_owned(),
+            rustc_fingerprint: 1,
+        }
+        .read(2)
+        .unwrap();
+        assert_eq!(output.stdout, "rustc output");
+    }
 }
