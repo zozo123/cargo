@@ -1,0 +1,194 @@
+name: Apply ready-unit scheduler fix
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - .github/cargo-scheduler-e2e-trigger
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.repository == 'zozo123/cargo'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/ready-unit-heap
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Restore validated ready-heap commit
+        run: git reset --hard 9c8691d224960d8688e19ef310686c71490cdb05
+
+      - name: Install Cargo's pinned toolchain
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup component add --toolchain 1.97.0 rustfmt clippy
+
+      - name: Replace the pending sorted Vec with a heap
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/compiler/job_queue/mod.rs")
+          source = path.read_text()
+
+          source = source.replace(
+              "use std::cell::RefCell;\n",
+              "use std::cell::RefCell;\nuse std::cmp::Ordering;\nuse std::collections::BinaryHeap;\n",
+              1,
+          )
+
+          marker = "pub struct JobQueue<'gctx> {\n    queue: DependencyQueue<Unit, Artifact, Job>,\n    counts: HashMap<PackageId, usize>,\n    timings: Timings<'gctx>,\n}\n\n"
+          addition = r'''/// A pending job ordered by Cargo's calculated scheduling priority.
+///
+/// `order` preserves the previous sorted-`Vec` behavior for equal priorities:
+/// later-enqueued jobs are popped first.
+struct Pending<T> {
+    value: T,
+    priority: usize,
+    order: usize,
+}
+
+impl<T> PartialEq for Pending<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority == other.priority && self.order == other.order
+    }
+}
+
+impl<T> Eq for Pending<T> {}
+
+impl<T> PartialOrd for Pending<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T> Ord for Pending<T> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.priority
+            .cmp(&other.priority)
+            .then_with(|| self.order.cmp(&other.order))
+    }
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::Pending;
+    use std::collections::BinaryHeap;
+
+    #[test]
+    fn pops_highest_priority_first() {
+        let mut queue = BinaryHeap::new();
+        queue.push(Pending {
+            value: "low",
+            priority: 1,
+            order: 0,
+        });
+        queue.push(Pending {
+            value: "high",
+            priority: 3,
+            order: 1,
+        });
+        queue.push(Pending {
+            value: "middle",
+            priority: 2,
+            order: 2,
+        });
+
+        assert_eq!(queue.pop().unwrap().value, "high");
+        assert_eq!(queue.pop().unwrap().value, "middle");
+        assert_eq!(queue.pop().unwrap().value, "low");
+    }
+
+    #[test]
+    fn pops_later_equal_priority_job_first() {
+        let mut queue = BinaryHeap::new();
+        queue.push(Pending {
+            value: "first",
+            priority: 1,
+            order: 0,
+        });
+        queue.push(Pending {
+            value: "second",
+            priority: 1,
+            order: 1,
+        });
+
+        assert_eq!(queue.pop().unwrap().value, "second");
+        assert_eq!(queue.pop().unwrap().value, "first");
+    }
+}
+
+'''
+          if marker not in source:
+              raise SystemExit("JobQueue marker changed")
+          source = source.replace(marker, marker + addition, 1)
+
+          source = source.replace(
+              "    pending_queue: Vec<(Unit, Job, usize)>,\n",
+              "    pending_queue: BinaryHeap<Pending<(Unit, Job)>>,\n    next_pending_order: usize,\n",
+              1,
+          )
+          source = source.replace(
+              "            pending_queue: Vec::new(),\n",
+              "            pending_queue: BinaryHeap::new(),\n            next_pending_order: 0,\n",
+              1,
+          )
+
+          old = r'''            // We want to keep the pieces of work in the `pending_queue` sorted
+            // by their priorities, and insert the current job at its correctly
+            // sorted position: following the lower priority jobs, and the ones
+            // with the same priority (since they were dequeued before the
+            // current one, we also keep that relation).
+            let idx = self
+                .pending_queue
+                .partition_point(|&(_, _, p)| p <= priority);
+            self.pending_queue.insert(idx, (unit, job, priority));
+'''
+          new = r'''            let order = self.next_pending_order;
+            self.next_pending_order += 1;
+            self.pending_queue.push(Pending {
+                value: (unit, job),
+                priority,
+                order,
+            });
+'''
+          if old not in source:
+              raise SystemExit("pending queue insertion block changed")
+          source = source.replace(old, new, 1)
+
+          old_pop = "            let (unit, job, _) = self.pending_queue.pop().unwrap();\n"
+          new_pop = r'''            let Pending {
+                value: (unit, job),
+                ..
+            } = self.pending_queue.pop().unwrap();
+'''
+          if old_pop not in source:
+              raise SystemExit("pending queue pop changed")
+          source = source.replace(old_pop, new_pop, 1)
+
+          path.write_text(source)
+          PY
+
+          cargo +1.97.0 fmt --all
+          git diff --check
+
+      - name: Validate completed scheduler
+        run: |
+          cargo +1.97.0 test --lib util::dependency_queue
+          cargo +1.97.0 test --lib compiler::job_queue::pending_tests
+          cargo +1.97.0 clippy --lib --tests --benches -- -D warnings
+
+      - name: Commit and push PR branch
+        run: |
+          git config user.name "Yossi Eliaz"
+          git config user.email "eliaz123@gmail.com"
+          git add src/compiler/job_queue/mod.rs
+          git commit -m "Use a heap for pending Cargo jobs"
+          git push origin HEAD:agent/ready-unit-heap
