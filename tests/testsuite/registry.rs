@@ -74,10 +74,12 @@ fn simple_git() {
 }
 
 #[cargo_test]
-fn registry_manifest_toml_cache() {
-    // Registry packages write a content-hashed deserialize cache and keep
-    // using it across warm invocations.
-    Package::new("bar", "0.0.1").publish();
+fn registry_manifest_fast_parse_path() {
+    // Registry packages use the lighter deserialize path (no spanned document).
+    // Ensure resolve + warm re-check still work.
+    Package::new("bar", "0.0.1")
+        .file("src/lib.rs", "pub fn f() {}")
+        .publish();
 
     let p = project()
         .file(
@@ -92,47 +94,16 @@ fn registry_manifest_toml_cache() {
                 bar = "0.0.1"
             "#,
         )
-        .file("src/lib.rs", "")
+        .file("src/lib.rs", "pub fn g() { bar::f(); }")
         .build();
 
     p.cargo("check").run();
-
-    let cache = paths::cargo_home()
-        .join("registry/src")
-        .read_dir()
-        .unwrap()
-        .flat_map(|entry| {
-            let entry = entry.unwrap();
-            let pkg = entry.path().join("bar-0.0.1");
-            let cache = pkg.join(".cargo-toml-cache");
-            cache.is_file().then_some(cache)
-        })
-        .next()
-        .expect("registry package should write .cargo-toml-cache");
-
-    let first = fs::read(&cache).unwrap();
-    assert!(!first.is_empty());
-
-    // Second warm check must still work with the cache present.
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
         .run();
-    assert_eq!(first, fs::read(&cache).unwrap());
-
-    // Corrupt cache falls back to a live parse and is rewritten.
-    fs::write(&cache, b"{not-json").unwrap();
-    p.cargo("check")
-        .with_stderr_data(str![[r#"
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-
-"#]])
-        .run();
-    let repaired = fs::read(&cache).unwrap();
-    assert_ne!(repaired, b"{not-json");
-    assert!(!repaired.is_empty());
 }
 
 fn simple(pre_clean_expected: impl IntoData, post_clean_expected: impl IntoData) {

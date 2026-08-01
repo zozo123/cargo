@@ -75,27 +75,23 @@ pub fn read_manifest(
     let is_embedded = is_embedded(path);
     let contents = read_toml_string(path, is_embedded, gctx)?;
 
-    // Registry packages are immutable once unpacked. Reuse a prior deserialize
-    // of `Cargo.toml` when the on-disk contents still match the cache entry.
-    // Workspace / path / git manifests stay on the live parse path.
-    let cached_original = if source_id.is_registry() {
-        registry_cache::load_original_toml(path, &contents)
-    } else {
-        None
-    };
-
-    let (original_toml, document) = if let Some(original_toml) = cached_original {
+    // Registry packages do not need spanned documents for diagnostics on the
+    // common path. Use a lighter deserialize that skips DeTable ownership work.
+    // Workspace / path / git manifests keep the full diagnostic-friendly path.
+    let (original_toml, document) = if source_id.is_registry() {
+        let original_toml = registry_cache::deserialize_registry_toml(&contents).map_err(|e| {
+            ManifestError::new(
+                e.context(format!("failed to parse manifest at `{}`", path.display())),
+                path.into(),
+            )
+        })?;
         (original_toml, None)
     } else {
         let document = parse_document(&contents)
             .map_err(|e| emit_toml_diagnostic(e.into(), &contents, path, gctx))?;
         let original_toml = deserialize_toml(&document)
             .map_err(|e| emit_toml_diagnostic(e.into(), &contents, path, gctx))?;
-        let document = make_document_owned(document);
-        if source_id.is_registry() {
-            registry_cache::store_original_toml(path, &contents, &original_toml);
-        }
-        (original_toml, Some(document))
+        (original_toml, Some(make_document_owned(document)))
     };
 
     let mut manifest = (|| {
