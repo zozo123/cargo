@@ -1,0 +1,231 @@
+name: Empty link work validation
+
+on:
+  push:
+    branches:
+      - validation/link-work-20260801
+
+permissions:
+  contents: read
+
+env:
+  BASE_SHA: 965260a4f34954f094ce858226a6158e2240f038
+  CANDIDATE_SHA: ${{ github.sha }}
+  ZED_SHA: 5e1fd392f67e27fa1da91bad43eef7db1a5dec23
+  CARGO_TERM_COLOR: never
+
+jobs:
+  validate:
+    name: Exact-ref Zed empty-link-work A/B
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out exact Cargo base
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          repository: rust-lang/cargo
+          ref: ${{ env.BASE_SHA }}
+          path: base
+          fetch-depth: 1
+
+      - name: Check out exact candidate
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          repository: zozo123/cargo
+          ref: ${{ env.CANDIDATE_SHA }}
+          path: candidate
+          fetch-depth: 2
+
+      - name: Check out exact Zed fixture
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          repository: zed-industries/zed
+          ref: ${{ env.ZED_SHA }}
+          path: zed
+          fetch-depth: 1
+
+      - name: Install pinned Rust toolchains
+        shell: bash
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Verify exact refs and runner capacity
+        shell: bash
+        run: |
+          test "$(git -C base rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test "$(git -C candidate rev-parse HEAD^)" = "$BASE_SHA"
+          test "$(git -C zed rev-parse HEAD)" = "$ZED_SHA"
+          test "$(git -C candidate diff --name-only HEAD^ HEAD -- src/compiler/mod.rs)" = "src/compiler/mod.rs"
+          lscpu
+          echo "RUNNER_CPUS=$(nproc)" >> "$GITHUB_ENV"
+
+      - name: Check link, JSON, export, artifact, and doc behavior
+        working-directory: candidate
+        shell: bash
+        run: |
+          cargo +1.97.0 test --test testsuite check::
+          cargo +1.97.0 test --test testsuite cache_messages::cached_as_json
+          cargo +1.97.0 test --test testsuite artifact_dir::cargo_build_artifact_dir
+          cargo +1.97.0 test --test testsuite artifact_dep::lib_with_bin_artifact_and_lib_false
+          cargo +1.97.0 test --test testsuite doc::doc_twice
+          cargo +1.97.0 test --test testsuite doc::doc_json_artifacts
+
+      - name: Install upstream Zed Linux prerequisites
+        working-directory: zed
+        shell: bash
+        run: ./script/linux
+
+      - name: Build exact base and candidate Cargo binaries
+        shell: bash
+        run: |
+          CARGO_TARGET_DIR="$RUNNER_TEMP/base-target" \
+            cargo +1.97.0 build --manifest-path base/Cargo.toml --locked --release --bin cargo
+          CARGO_TARGET_DIR="$RUNNER_TEMP/candidate-target" \
+            cargo +1.97.0 build --manifest-path candidate/Cargo.toml --locked --release --bin cargo
+
+      - name: Fetch Zed locked dependencies outside timing
+        shell: bash
+        run: |
+          "$RUNNER_TEMP/candidate-target/release/cargo" \
+            fetch --manifest-path zed/Cargo.toml --locked
+
+      - name: Check full Zed graph with candidate Cargo
+        shell: bash
+        run: |
+          zed_rustc="$(rustup which --toolchain 1.95.0 rustc)"
+          zed_rustdoc="$(rustup which --toolchain 1.95.0 rustdoc)"
+          /usr/bin/time -f 'candidate cold Zed check: %e s elapsed, %M KiB max RSS' \
+            env RUSTC="$zed_rustc" RUSTDOC="$zed_rustdoc" \
+              CARGO_TARGET_DIR="$RUNNER_TEMP/zed-target" \
+              "$RUNNER_TEMP/candidate-target/release/cargo" \
+              check --manifest-path zed/Cargo.toml -p zed --frozen --quiet
+
+      - name: Measure paired warm Zed no-op checks
+        shell: bash
+        run: |
+          export ZED_RUSTC="$(rustup which --toolchain 1.95.0 rustc)"
+          export ZED_RUSTDOC="$(rustup which --toolchain 1.95.0 rustdoc)"
+          python3 - <<'PY'
+          import json
+          import os
+          import random
+          import statistics
+          import subprocess
+          import time
+
+          root = os.environ["RUNNER_TEMP"]
+          env = os.environ.copy()
+          env.update({
+              "RUSTC": os.environ["ZED_RUSTC"],
+              "RUSTDOC": os.environ["ZED_RUSTDOC"],
+              "CARGO_TARGET_DIR": f"{root}/zed-target",
+          })
+          binaries = {
+              "base": f"{root}/base-target/release/cargo",
+              "candidate": f"{root}/candidate-target/release/cargo",
+          }
+
+          def command(variant, json_messages=False):
+              args = [
+                  binaries[variant], "check", "--manifest-path", "zed/Cargo.toml",
+                  "-p", "zed", "--frozen", "--quiet",
+              ]
+              if json_messages:
+                  args.extend(["--message-format", "json"])
+              return args
+
+          def capture(variant):
+              return subprocess.run(
+                  command(variant, json_messages=True), env=env, check=True,
+                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+              )
+
+          captured = {variant: capture(variant) for variant in ("base", "candidate")}
+          for variant, completed in captured.items():
+              artifacts = [
+                  message
+                  for line in completed.stdout.splitlines()
+                  if (message := json.loads(line)).get("reason") == "compiler-artifact"
+              ]
+              if not artifacts or not all(message["fresh"] for message in artifacts):
+                  raise SystemExit(f"{variant} preflight was not a true no-op")
+          if captured["base"].stdout != captured["candidate"].stdout:
+              raise SystemExit("base and candidate JSON message streams differ")
+          if captured["base"].stderr != captured["candidate"].stderr:
+              raise SystemExit("base and candidate stderr streams differ")
+
+          def run(variant):
+              subprocess.run(
+                  command(variant), env=env, check=True,
+                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+              )
+
+          for _ in range(5):
+              run("base")
+              run("candidate")
+
+          samples = {"base": [], "candidate": []}
+          pairs = []
+          for pair_index in range(40):
+              order = ("base", "candidate") if pair_index % 2 == 0 else ("candidate", "base")
+              current = {}
+              for variant in order:
+                  start = time.perf_counter_ns()
+                  run(variant)
+                  elapsed = time.perf_counter_ns() - start
+                  current[variant] = elapsed
+                  samples[variant].append(elapsed)
+              pairs.append((current["base"], current["candidate"]))
+
+          blocks = [pairs[index:index + 2] for index in range(0, len(pairs), 2)]
+          if any(len(block) != 2 for block in blocks):
+              raise SystemExit("paired benchmark requires an even pair count")
+          rng = random.Random(17305)
+          ratios = []
+          for _ in range(20_000):
+              chosen_blocks = [blocks[rng.randrange(len(blocks))] for _ in blocks]
+              chosen = [pair for block in chosen_blocks for pair in block]
+              ratios.append(sum(candidate for _, candidate in chosen) / sum(base for base, _ in chosen))
+          ratios.sort()
+          median_base = statistics.median(samples["base"])
+          median_candidate = statistics.median(samples["candidate"])
+          aggregate_ratio = sum(candidate for _, candidate in pairs) / sum(base for base, _ in pairs)
+          lower, upper = ratios[500], ratios[19499]
+          median_ratio = median_candidate / median_base
+          strong = upper < 1.0 and median_ratio <= 0.98
+
+          print(json.dumps({
+              "check_pairs_ms": [[base / 1e6, candidate / 1e6] for base, candidate in pairs],
+          }, separators=(",", ":")))
+          report = "\n".join([
+              "### Empty link-work validation",
+              "",
+              f"Exact Cargo base `{os.environ['BASE_SHA'][:12]}`, candidate `{os.environ['CANDIDATE_SHA'][:12]}`, "
+              f"Zed `{os.environ['ZED_SHA'][:12]}`, Cargo-default parallelism on "
+              f"{os.environ['RUNNER_CPUS']} logical CPUs.",
+              "The candidate cold check and targeted behavior matrix passed. Base and candidate "
+              "produced byte-identical JSON and stderr streams on a true no-op preflight.",
+              "",
+              "The candidate skips work only for non-JSON units with no link or export destination; "
+              "non-JSON check units skip before output enumeration.",
+              "",
+              "- alternating adjacent pairs: 40",
+              f"- base median: {median_base / 1e6:.3f} ms",
+              f"- candidate median: {median_candidate / 1e6:.3f} ms",
+              f"- median saving: {(median_base - median_candidate) / 1e6:.3f} ms",
+              f"- median candidate/base ratio: {median_ratio:.4f}",
+              f"- paired aggregate candidate/base ratio: {aggregate_ratio:.4f}",
+              f"- paired bootstrap mean-time ratio 95% CI: [{lower:.4f}, {upper:.4f}]",
+              f"- evidence gate: **{'PASS' if strong else 'DO NOT PUBLISH'}**",
+              "",
+              "The gate requires a statistically significant warm full-Zed win of at least 2% by medians.",
+              "",
+          ])
+          print(report)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(report)
+          if not strong:
+              raise SystemExit("evidence gate failed")
+          PY

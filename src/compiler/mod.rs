@@ -635,14 +635,28 @@ fn link_targets(
     fresh: bool,
 ) -> CargoResult<Work> {
     let bcx = build_runner.bcx;
+    let json_messages = bcx.build_config.emit_json();
+    // `cargo check` outputs are never uplifted, and export paths are only
+    // created for uplifted outputs. Without JSON, there is no link work.
+    if unit.mode.is_check() && !json_messages {
+        return Ok(Work::noop());
+    }
     let outputs = build_runner.outputs(unit)?;
+    // Without JSON, outputs that stay in the hashed target directory do not
+    // need any linking or export work.
+    if !json_messages
+        && outputs
+            .iter()
+            .all(|output| output.hardlink.is_none() && output.export_path.is_none())
+    {
+        return Ok(Work::noop());
+    }
     let export_dir = build_runner.files().export_dir();
     let package_id = unit.pkg.package_id();
     let manifest_path = PathBuf::from(unit.pkg.manifest_path());
     let profile = unit.profile.clone();
     let unit_mode = unit.mode;
     let features = unit.features.iter().map(|s| s.to_string()).collect();
-    let json_messages = bcx.build_config.emit_json();
     let executable = build_runner.get_executable(unit)?;
     let mut target = Target::clone(&unit.target);
     if let TargetSourcePath::Metabuild = target.src_path() {
