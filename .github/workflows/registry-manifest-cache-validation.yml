@@ -218,8 +218,8 @@ jobs:
               f"Zed `{os.environ['ZED_SHA'][:12]}`, Cargo-default parallelism on "
               f"{os.environ['RUNNER_CPUS']} logical CPUs.",
               "",
-              "Candidate seeds `.cargo-toml-cache` sidecars during the untimed cold check. "
-              "Base never reads those sidecars.",
+              "Candidate uses the lighter registry TOML deserialize path; "
+              "base uses the spanned document path.",
               "",
           ]
           report += block("Frozen Zed metadata (registry light-parse path)", metadata)
