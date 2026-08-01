@@ -222,15 +222,22 @@ fn compile<'gctx>(
                 };
                 work.then(link_targets(build_runner, unit, false)?)
             } else {
-                let output_options = OutputOptions::for_fresh(build_runner, unit);
-                let manifest = ManifestErrorContext::new(build_runner, unit);
-                let work = replay_output_cache(
-                    unit.pkg.package_id(),
-                    manifest,
-                    &unit.target,
-                    build_runner.files().message_cache_path(unit),
-                    output_options,
-                );
+                let message_cache_path = build_runner.files().message_cache_path(unit);
+                // Most units do not emit diagnostics, so avoid constructing the
+                // context needed to replay a cache that does not exist.
+                let work = if message_cache_path.exists() {
+                    let output_options = OutputOptions::for_fresh(build_runner, unit);
+                    let manifest = ManifestErrorContext::new(build_runner, unit);
+                    replay_output_cache(
+                        unit.pkg.package_id(),
+                        manifest,
+                        &unit.target,
+                        message_cache_path,
+                        output_options,
+                    )
+                } else {
+                    Work::noop()
+                };
                 // Need to link targets on both the dirty and fresh.
                 work.then(link_targets(build_runner, unit, true)?)
             });
