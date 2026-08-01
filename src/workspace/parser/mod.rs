@@ -44,6 +44,7 @@ use crate::workspace::{
 };
 
 mod embedded;
+mod registry_cache;
 mod targets;
 
 use self::targets::to_targets;
@@ -73,12 +74,29 @@ pub fn read_manifest(
 
     let is_embedded = is_embedded(path);
     let contents = read_toml_string(path, is_embedded, gctx)?;
-    let document = parse_document(&contents)
-        .map_err(|e| emit_toml_diagnostic(e.into(), &contents, path, gctx))?;
-    let original_toml = deserialize_toml(&document)
-        .map_err(|e| emit_toml_diagnostic(e.into(), &contents, path, gctx))?;
 
-    let document = make_document_owned(document);
+    // Registry packages are immutable once unpacked. Reuse a prior deserialize
+    // of `Cargo.toml` when the on-disk contents still match the cache entry.
+    // Workspace / path / git manifests stay on the live parse path.
+    let cached_original = if source_id.is_registry() {
+        registry_cache::load_original_toml(path, &contents)
+    } else {
+        None
+    };
+
+    let (original_toml, document) = if let Some(original_toml) = cached_original {
+        (original_toml, None)
+    } else {
+        let document = parse_document(&contents)
+            .map_err(|e| emit_toml_diagnostic(e.into(), &contents, path, gctx))?;
+        let original_toml = deserialize_toml(&document)
+            .map_err(|e| emit_toml_diagnostic(e.into(), &contents, path, gctx))?;
+        let document = make_document_owned(document);
+        if source_id.is_registry() {
+            registry_cache::store_original_toml(path, &contents, &original_toml);
+        }
+        (original_toml, Some(document))
+    };
 
     let mut manifest = (|| {
         let empty = Vec::new();
@@ -105,7 +123,7 @@ pub fn read_manifest(
         if normalized_toml.package().is_some() {
             to_real_manifest(
                 Some(contents),
-                Some(document),
+                document,
                 original_toml,
                 normalized_toml,
                 features,
@@ -122,7 +140,7 @@ pub fn read_manifest(
             assert!(!is_embedded);
             to_virtual_manifest(
                 Some(contents),
-                Some(document),
+                document,
                 original_toml,
                 normalized_toml,
                 features,

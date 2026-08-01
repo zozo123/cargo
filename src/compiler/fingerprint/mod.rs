@@ -979,6 +979,11 @@ impl LocalFingerprint {
                         current: current.map(Into::into),
                     }));
                 }
+                // Many crates emit dep-info with zero tracked files. After env
+                // checks, there is nothing left to mtime/checksum-probe.
+                if info.files.is_empty() {
+                    return Ok(None);
+                }
                 if *checksum {
                     Ok(find_stale_file(
                         mtime_cache,

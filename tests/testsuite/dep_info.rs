@@ -474,6 +474,65 @@ fn reg_dep_source_not_tracked() {
     );
 }
 
+#[cargo_test]
+fn empty_dep_info_still_tracks_file_and_environment() {
+    Package::new("regdep", "0.1.0")
+        .file(
+            "src/lib.rs",
+            r#"pub const TRACKED: Option<&str> = option_env!("EMPTY_DEP_INFO_ENV");"#,
+        )
+        .publish();
+
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+            [package]
+            name = "foo"
+            version = "0.1.0"
+            edition = "2021"
+
+            [dependencies]
+            regdep = "0.1"
+            "#,
+        )
+        .file("src/lib.rs", "pub use regdep::TRACKED;")
+        .build();
+
+    p.cargo("check").env_remove("EMPTY_DEP_INFO_ENV").run();
+    assert_deps(
+        &p,
+        "target/debug/.fingerprint/regdep-*/dep-lib-regdep",
+        |_, entries| assert!(entries.is_empty()),
+    );
+    p.cargo("check")
+        .env_remove("EMPTY_DEP_INFO_ENV")
+        .with_stderr_does_not_contain("[CHECKING] regdep v0.1.0")
+        .run();
+
+    p.cargo("check")
+        .env("EMPTY_DEP_INFO_ENV", "changed")
+        .with_stderr_contains("[CHECKING] regdep v0.1.0")
+        .run();
+
+    let dep_info = p
+        .glob("target/debug/.fingerprint/regdep-*/dep-lib-regdep")
+        .next()
+        .unwrap()
+        .unwrap();
+    std::fs::remove_file(&dep_info).unwrap();
+    p.cargo("check")
+        .env("EMPTY_DEP_INFO_ENV", "changed")
+        .with_stderr_contains("[CHECKING] regdep v0.1.0")
+        .run();
+
+    std::fs::write(&dep_info, b"not dep-info").unwrap();
+    p.cargo("check")
+        .env("EMPTY_DEP_INFO_ENV", "changed")
+        .with_stderr_contains("[CHECKING] regdep v0.1.0")
+        .run();
+}
+
 #[cargo_test(nightly, reason = "-Z binary-dep-depinfo is unstable")]
 fn canonical_path() {
     if !cargo_test_support::symlink_supported() {
