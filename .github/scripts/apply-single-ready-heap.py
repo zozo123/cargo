@@ -1,23 +1,29 @@
 from pathlib import Path
 
 job_path = Path("src/compiler/job_queue/mod.rs")
-text = job_path.read_text()
+job = job_path.read_text()
 
-imports = "use std::cmp::Ordering;\nuse std::collections::BinaryHeap;\n"
-assert imports in text
-text = text.replace(imports, "", 1)
-
-pending_start = text.index("/// A pending job ordered by scheduling priority.")
-drain_docs = text.index(
+helper_start = job.index("fn desired_jobserver_tokens(")
+helper_end = job.index(
     "/// This structure is backed by the `DependencyQueue` type and manages the\n"
     "/// actual compilation step of each package.",
-    pending_start,
+    helper_start,
 )
-helper = """fn desired_jobserver_tokens(active: usize, ready: usize, jobs: u32) -> usize {
-    active
-        .saturating_add(ready)
-        .saturating_sub(1)
-        .min(jobs.saturating_sub(1) as usize)
+helper = """fn desired_jobserver_tokens(
+    active: usize,
+    ready: usize,
+    jobs: u32,
+    owns_jobserver: bool,
+) -> usize {
+    let needed = active.saturating_add(ready).saturating_sub(1);
+    if owns_jobserver {
+        needed.min(jobs.saturating_sub(1) as usize)
+    } else {
+        // An inherited jobserver may expose more capacity than Cargo's local
+        // `jobs` setting. Preserve the previous one-request-per-ready-job
+        // behavior instead of imposing a new local cap.
+        needed
+    }
 }
 
 #[cfg(test)]
@@ -25,141 +31,155 @@ mod scheduler_tests {
     use super::desired_jobserver_tokens;
 
     #[test]
-    fn bounds_jobserver_requests_by_work_and_parallelism() {
-        assert_eq!(desired_jobserver_tokens(0, 0, 8), 0);
-        assert_eq!(desired_jobserver_tokens(0, 1, 8), 0);
-        assert_eq!(desired_jobserver_tokens(0, 10, 4), 3);
-        assert_eq!(desired_jobserver_tokens(2, 0, 4), 1);
-        assert_eq!(desired_jobserver_tokens(2, 10, 1), 0);
+    fn bounds_owned_jobserver_requests_by_work_and_parallelism() {
+        assert_eq!(desired_jobserver_tokens(0, 0, 8, true), 0);
+        assert_eq!(desired_jobserver_tokens(0, 1, 8, true), 0);
+        assert_eq!(desired_jobserver_tokens(0, 10, 4, true), 3);
+        assert_eq!(desired_jobserver_tokens(2, 0, 4, true), 1);
+        assert_eq!(desired_jobserver_tokens(2, 10, 1, true), 0);
+    }
+
+    #[test]
+    fn does_not_cap_an_inherited_jobserver() {
+        assert_eq!(desired_jobserver_tokens(0, 10, 4, false), 9);
+        assert_eq!(desired_jobserver_tokens(2, 10, 4, false), 11);
     }
 }
 
 """
-text = text[:pending_start] + helper + text[drain_docs:]
+job = job[:helper_start] + helper + job[helper_end:]
 
-old_fields = """    /// The list of jobs that we have not yet started executing, but have
-    /// retrieved from the `queue`. We eagerly pull jobs off the main queue to
-    /// allow us to request jobserver tokens pretty early.
-    pending_queue: BinaryHeap<Pending<(Unit, Job)>>,
-    next_pending_order: usize,
-"""
-new_fields = """    /// Jobserver token requests that have not completed yet.
-    pending_token_requests: usize,
-"""
-assert old_fields in text
-text = text.replace(old_fields, new_fields, 1)
-
-old_init = """            tokens: Vec::new(),
-            pending_queue: BinaryHeap::new(),
-            next_pending_order: 0,
-            print: DiagnosticPrinter::new(
-"""
-new_init = """            tokens: Vec::new(),
-            pending_token_requests: 0,
-            print: DiagnosticPrinter::new(
-"""
-assert old_init in text
-text = text.replace(old_init, new_init, 1)
-
-function_start = text.index("    fn spawn_work_if_possible<'s>(")
-function_end = text.index("    fn has_extra_tokens(&self) -> bool {", function_start)
-new_function = """    fn spawn_work_if_possible<'s>(
-        &mut self,
-        build_runner: &mut BuildRunner<'_, '_>,
-        jobserver_helper: &HelperThread,
-        scope: &'s Scope<'s, '_>,
-    ) -> CargoResult<()> {
-        // Keep enough token requests in flight to saturate the configured
-        // parallelism. Ready jobs stay in the dependency queue until capacity
-        // exists, avoiding a second priority queue and one request per unit.
-        let desired_tokens = desired_jobserver_tokens(
+old_call = """        let desired_tokens = desired_jobserver_tokens(
             self.active.len(),
             self.queue.ready_len(),
             build_runner.bcx.jobs(),
         );
-        let requested_tokens = self.tokens.len() + self.pending_token_requests;
-        for _ in requested_tokens..desired_tokens {
-            jobserver_helper.request_token();
-            self.pending_token_requests += 1;
-        }
-
-        while self.has_extra_tokens() {
-            let Some((unit, job, _priority)) = self.queue.dequeue() else {
-                break;
-            };
-            *self.counts.get_mut(&unit.pkg.package_id()).unwrap() -= 1;
-            // Print out some nice progress information.
-            // NOTE: An error here will drop the job without starting it.
-            // That should be OK, since we want to exit as soon as
-            // possible during an error.
-            self.note_working_on(
-                build_runner.bcx.gctx,
-                build_runner.bcx.ws.root(),
-                &unit,
-                job.freshness(),
-            )?;
-            self.run(&unit, job, build_runner, scope);
-        }
-
-        Ok(())
-    }
-
 """
-text = text[:function_start] + new_function + text[function_end:]
-
-old_token = """            Message::Token(acquired_token) => {
-                let token = acquired_token.context("failed to acquire jobserver token")?;
-                self.tokens.push(token);
-            }
+new_call = """        let desired_tokens = desired_jobserver_tokens(
+            self.active.len(),
+            self.queue.ready_len(),
+            build_runner.bcx.jobs(),
+            build_runner.bcx.gctx.jobserver_from_env().is_none(),
+        );
 """
-new_token = """            Message::Token(acquired_token) => {
-                self.pending_token_requests = self
-                    .pending_token_requests
-                    .checked_sub(1)
-                    .expect("received a jobserver token without requesting one");
-                let token = acquired_token.context("failed to acquire jobserver token")?;
-                self.tokens.push(token);
-            }
-"""
-assert old_token in text
-text = text.replace(old_token, new_token, 1)
-
-old_done = "        } else if self.queue.is_empty() && self.pending_queue.is_empty() {\n"
-assert old_done in text
-text = text.replace(old_done, "        } else if self.queue.is_empty() {\n", 1)
-
-old_loop_docs = """        // loop starts out by scheduling as much work as possible (up to the
-        // maximum number of parallel jobs we have tokens for). A local queue
-        // is maintained separately from the main dependency queue as one
-        // dequeue may actually dequeue quite a bit of work (e.g., 10 binaries
-        // in one package).
-"""
-new_loop_docs = """        // loop starts out by requesting enough jobserver tokens for the ready
-        // frontier and scheduling as much work as possible directly from the
-        // dependency queue.
-"""
-assert old_loop_docs in text
-text = text.replace(old_loop_docs, new_loop_docs, 1)
-job_path.write_text(text)
+assert old_call in job
+job = job.replace(old_call, new_call, 1)
+job = job.replace(
+    "        // Keep enough token requests in flight to saturate the configured\n"
+    "        // parallelism. Ready jobs stay in the dependency queue until capacity\n"
+    "        // exists, avoiding a second priority queue and one request per unit.\n",
+    "        // Keep enough token requests in flight to saturate a Cargo-owned\n"
+    "        // jobserver. Ready jobs stay in the dependency queue until capacity\n"
+    "        // exists, avoiding a second priority queue and excess requests.\n",
+    1,
+)
+job_path.write_text(job)
 
 dependency_path = Path("src/util/dependency_queue.rs")
 dependency = dependency_path.read_text()
-old_len = """    pub fn len(&self) -> usize {
-        self.dep_map.len()
-    }
-
-    /// Indicate that something has finished.
+dependency = dependency.replace(
+    ".then_with(|| self.order.cmp(&other.order))",
+    ".then_with(|| other.order.cmp(&self.order))",
+    1,
+)
+dependency = dependency.replace(
+    "    /// Nodes with no remaining dependencies, ordered by priority and then by\n"
+    "    /// the same map order used by the previous scan-based implementation.\n",
+    "    /// Nodes with no remaining dependencies, ordered by priority and then by\n"
+    "    /// the dispatch order of the previous scan-plus-pending-queue scheduler.\n",
+    1,
+)
+old_comment = """        // `Iterator::max_by_key`, used by the previous dequeue implementation,
+        // selected the last equal-priority item in map iteration order. Retain
+        // that order as a tie-breaker so replacing the scan does not change the
+        // schedule for equal priorities.
 """
-new_len = """    pub fn len(&self) -> usize {
-        self.dep_map.len()
-    }
-
-    /// Returns the number of packages that can be dequeued immediately.
-    pub(crate) fn ready_len(&self) -> usize {
-        self.ready.len()
-    }
-
-    /// Indicate that something has finished.
+new_comment = """        // The previous scheduler scanned ready nodes with `max_by_key`, inserted
+        // the resulting sequence into a sorted pending queue, and popped from
+        // its end. Those two reversals dispatched equal-priority nodes in map
+        // iteration order. Retain that final dispatch order as the tie-breaker.
 """
-assert old_len in dependency
-dependency_path.write_text(dependency.replace(old_len, new_len, 1))
+assert old_comment in dependency
+dependency = dependency.replace(old_comment, new_comment, 1)
+
+tests_start = dependency.index("    #[test]\n    fn preserves_equal_priority_scan_order()")
+new_tests = """    #[test]
+    fn preserves_equal_priority_dispatch_order() {
+        let mut q: DependencyQueue<i32, (), ()> = DependencyQueue::new();
+
+        for node in 0..16 {
+            q.queue(node, (), std::iter::empty::<(i32, ())>(), 1);
+        }
+
+        let expected = q.dep_map.keys().copied().collect::<Vec<_>>();
+        q.queue_finished();
+
+        let actual =
+            std::iter::from_fn(|| q.dequeue().map(|(node, (), _)| node)).collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn heap_matches_previous_dispatch_across_dynamic_frontiers() {
+        for seed in 0..16 {
+            let mut heap: DependencyQueue<usize, (), ()> = DependencyQueue::new();
+            let mut scan: DependencyQueue<usize, (), ()> = DependencyQueue::new();
+
+            for node in 0..64 {
+                let dependencies = (0..node)
+                    .filter(|dependency| (node * 37 + dependency * 17 + seed * 13) % 11 < 2)
+                    .map(|dependency| (dependency, ()))
+                    .collect::<Vec<_>>();
+                let cost = (node + seed) % 5 + 1;
+                heap.queue(node, (), dependencies.clone(), cost);
+                scan.queue(node, (), dependencies, cost);
+            }
+            heap.queue_finished();
+            scan.queue_finished();
+
+            loop {
+                let expected = drain_ready_by_previous_scheduler(&mut scan);
+                let actual = std::iter::from_fn(|| heap.dequeue()).collect::<Vec<_>>();
+                assert_eq!(actual, expected, "seed {seed}");
+
+                if actual.is_empty() {
+                    break;
+                }
+                for (node, (), _) in actual {
+                    heap.finish(&node, &());
+                    scan.finish(&node, &());
+                }
+            }
+
+            assert!(heap.is_empty(), "seed {seed}");
+            assert!(scan.is_empty(), "seed {seed}");
+        }
+    }
+
+    fn drain_ready_by_previous_scheduler(
+        queue: &mut DependencyQueue<usize, (), ()>,
+    ) -> Vec<(usize, (), usize)> {
+        let mut pending = Vec::new();
+        while let Some((key, value, priority)) = dequeue_by_scan(queue) {
+            let index = pending.partition_point(|&(_, _, queued_priority)| {
+                queued_priority <= priority
+            });
+            pending.insert(index, (key, value, priority));
+        }
+        std::iter::from_fn(|| pending.pop()).collect()
+    }
+
+    fn dequeue_by_scan(queue: &mut DependencyQueue<usize, (), ()>) -> Option<(usize, (), usize)> {
+        let (key, priority) = queue
+            .dep_map
+            .iter()
+            .filter(|(_, (dependencies, _))| dependencies.is_empty())
+            .map(|(key, _)| (*key, queue.priority[key].0))
+            .max_by_key(|(_, priority)| *priority)?;
+        let (_, value) = queue.dep_map.remove(&key).unwrap();
+        Some((key, value, priority))
+    }
+}
+"""
+dependency = dependency[:tests_start] + new_tests
+dependency_path.write_text(dependency)
