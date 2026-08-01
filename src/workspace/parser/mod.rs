@@ -73,12 +73,29 @@ pub fn read_manifest(
 
     let is_embedded = is_embedded(path);
     let contents = read_toml_string(path, is_embedded, gctx)?;
-    let document = parse_document(&contents)
-        .map_err(|e| emit_toml_diagnostic(e.into(), &contents, path, gctx))?;
-    let original_toml = deserialize_toml(&document)
-        .map_err(|e| emit_toml_diagnostic(e.into(), &contents, path, gctx))?;
 
-    let document = make_document_owned(document);
+    // Local path packages (and embedded sources) keep the full spanned
+    // document so diagnostics can point at exact keys. Non-local packages
+    // (registry, git, …) do not need that cost on the common warm path:
+    // deserialize with toml::from_str and skip DeTable ownership work.
+    let (original_toml, document) = if source_id.is_path() || is_embedded {
+        let document = parse_document(&contents)
+            .map_err(|e| emit_toml_diagnostic(e.into(), &contents, path, gctx))?;
+        let original_toml = deserialize_toml(&document)
+            .map_err(|e| emit_toml_diagnostic(e.into(), &contents, path, gctx))?;
+        (original_toml, Some(make_document_owned(document)))
+    } else {
+        let original_toml: manifest::TomlManifest = toml::from_str(&contents).map_err(|e| {
+            ManifestError::new(
+                anyhow::Error::from(e).context(format!(
+                    "failed to parse manifest at `{}`",
+                    path.display()
+                )),
+                path.into(),
+            )
+        })?;
+        (original_toml, None)
+    };
 
     let mut manifest = (|| {
         let empty = Vec::new();
@@ -105,7 +122,7 @@ pub fn read_manifest(
         if normalized_toml.package().is_some() {
             to_real_manifest(
                 Some(contents),
-                Some(document),
+                document,
                 original_toml,
                 normalized_toml,
                 features,
@@ -122,7 +139,7 @@ pub fn read_manifest(
             assert!(!is_embedded);
             to_virtual_manifest(
                 Some(contents),
-                Some(document),
+                document,
                 original_toml,
                 normalized_toml,
                 features,
