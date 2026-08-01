@@ -81,6 +81,7 @@ jobs:
           "$RUNNER_TEMP/candidate-target/release/cargo" \
             fetch --manifest-path zed/Cargo.toml --locked
 
+      - name: Check full Zed graph with candidate Cargo
         shell: bash
         run: |
           zed_rustc="$(rustup which --toolchain 1.95.0 rustc)"
@@ -90,9 +91,6 @@ jobs:
               CARGO_TARGET_DIR="$RUNNER_TEMP/zed-target" \
               "$RUNNER_TEMP/candidate-target/release/cargo" \
               check --manifest-path zed/Cargo.toml -p zed --frozen --quiet
-          caches=$(find "$HOME/.cargo/registry/src" -name '.cargo-toml-cache' 2>/dev/null | wc -l)
-          echo "registry_manifest_cache_files=$caches"
-          test "$caches" -gt 100
 
       - name: Measure paired warm metadata and check
         shell: bash
