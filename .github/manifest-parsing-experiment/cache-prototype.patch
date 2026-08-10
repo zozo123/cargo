@@ -11,7 +11,7 @@ index cb51fe36f..000000000 100644
  };
  
  mod embedded;
-@@ -73,12 +73,32 @@ pub fn read_manifest(
+@@ -73,12 +73,30 @@ pub fn read_manifest(
  
      let is_embedded = is_embedded(path);
      let contents = read_toml_string(path, is_embedded, gctx)?;
@@ -47,7 +47,7 @@ index cb51fe36f..000000000 100644
  
      let mut manifest = (|| {
          let empty = Vec::new();
-@@ -105,7 +125,7 @@ pub fn read_manifest(
+@@ -105,7 +123,7 @@ pub fn read_manifest(
          if normalized_toml.package().is_some() {
              to_real_manifest(
                  Some(contents),
@@ -56,7 +56,7 @@ index cb51fe36f..000000000 100644
                  original_toml,
                  normalized_toml,
                  features,
-@@ -122,7 +142,7 @@ pub fn read_manifest(
+@@ -122,7 +140,7 @@ pub fn read_manifest(
              assert!(!is_embedded);
              to_virtual_manifest(
                  Some(contents),
@@ -65,7 +65,7 @@ index cb51fe36f..000000000 100644
                  original_toml,
                  normalized_toml,
                  features,
-@@ -191,10 +211,58 @@ fn parse_document(contents: &str) -> Result<toml::Spanned<toml::de::DeTable<'_>>
+@@ -191,10 +209,9 @@ fn parse_document(contents: &str) -> Result<toml::Spanned<toml::de::DeTable<'_>>
  
  #[tracing::instrument(skip_all)]
  fn deserialize_toml(
@@ -77,7 +77,7 @@ index cb51fe36f..000000000 100644
      let mut document: manifest::TomlManifest = serde_ignored::deserialize(deserializer, |path| {
          let mut key = String::new();
          stringify(&mut key, &path);
-@@ -204,6 +272,48 @@ fn deserialize_toml(
+@@ -204,5 +221,43 @@ fn deserialize_toml(
      Ok(document)
  }
  
