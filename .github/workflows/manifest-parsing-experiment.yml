@@ -1,0 +1,262 @@
+name: Manifest parsing experiment
+
+on:
+  push:
+    branches:
+      - experiment/14395-manifest-cache
+    paths:
+      - .github/workflows/manifest-parsing-experiment.yml
+      - .github/manifest-parsing-experiment/**
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    if: github.repository == 'zozo123/cargo'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      UPSTREAM_SHA: 9184583d2dc29ac1e23c6304f7281fd3941bb1bb
+      PR_17296_SHA: 620a14528dbf00d5fb4ac6423e9c443f2c7080bf
+      ZED_SHA: 5e03f2d387e629237c10a4e4fed881b64abd8fea
+      CARGO_TERM_COLOR: never
+      RUST_BACKTRACE: 1
+
+    steps:
+      - name: Record runner
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/results" "$RUNNER_TEMP/bin"
+          {
+            echo "date_utc=$(date -u +%FT%TZ)"
+            echo "os=$(uname -a)"
+            echo "cpus=$(nproc)"
+            echo "memory_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
+            lscpu
+          } | tee "$RUNNER_TEMP/results/system.txt"
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup run 1.97.0 rustc --version --verbose | tee "$RUNNER_TEMP/results/rust.txt"
+
+      - name: Build current upstream and rebased 17296 experiment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git init "$RUNNER_TEMP/cargo-src"
+          cd "$RUNNER_TEMP/cargo-src"
+          git remote add upstream https://github.com/rust-lang/cargo.git
+          git remote add fork https://github.com/zozo123/cargo.git
+          git fetch --depth 1 upstream "$UPSTREAM_SHA"
+          git branch upstream-base FETCH_HEAD
+          git fetch --depth 1 fork "$PR_17296_SHA"
+
+          git worktree add --detach "$RUNNER_TEMP/cargo-base" upstream-base
+          git worktree add --detach "$RUNNER_TEMP/cargo-17296" upstream-base
+          cd "$RUNNER_TEMP/cargo-17296"
+          git -c user.name=benchmark -c user.email=benchmark@example.invalid cherry-pick "$PR_17296_SHA"
+
+          CARGO_TARGET_DIR="$RUNNER_TEMP/cargo-base-target" \
+            cargo +1.97.0 build --release --locked --bin cargo \
+            --manifest-path "$RUNNER_TEMP/cargo-base/Cargo.toml"
+          cp "$RUNNER_TEMP/cargo-base-target/release/cargo" "$RUNNER_TEMP/bin/cargo-base"
+
+          CARGO_TARGET_DIR="$RUNNER_TEMP/cargo-17296-target" \
+            cargo +1.97.0 build --release --locked --bin cargo \
+            --manifest-path "$RUNNER_TEMP/cargo-17296/Cargo.toml"
+          cp "$RUNNER_TEMP/cargo-17296-target/release/cargo" "$RUNNER_TEMP/bin/cargo-17296"
+          chmod +x "$RUNNER_TEMP/bin/cargo-base" "$RUNNER_TEMP/bin/cargo-17296"
+
+          "$RUNNER_TEMP/bin/cargo-base" --version --verbose | tee "$RUNNER_TEMP/results/cargo-base-version.txt"
+          "$RUNNER_TEMP/bin/cargo-17296" --version --verbose | tee "$RUNNER_TEMP/results/cargo-17296-version.txt"
+          git -C "$RUNNER_TEMP/cargo-17296" log -1 --oneline | tee "$RUNNER_TEMP/results/17296-rebased-commit.txt"
+
+      - name: Checkout pinned Zed and prime sources
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git init "$RUNNER_TEMP/zed"
+          cd "$RUNNER_TEMP/zed"
+          git remote add origin https://github.com/zed-industries/zed.git
+          git fetch --depth 1 origin "$ZED_SHA"
+          git checkout --detach FETCH_HEAD
+          ./script/linux
+
+          export RUSTUP_TOOLCHAIN=1.97.0
+          export CARGO_HOME="$RUNNER_TEMP/cargo-home"
+          "$RUNNER_TEMP/bin/cargo-base" fetch --locked
+          "$RUNNER_TEMP/bin/cargo-base" metadata --format-version 1 --locked --offline >/dev/null
+          "$RUNNER_TEMP/bin/cargo-17296" metadata --format-version 1 --locked --offline >/dev/null
+
+      - name: Measure alternating cargo metadata runs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/zed"
+          python3 - <<'PY'
+          import csv
+          import json
+          import os
+          import statistics
+          import subprocess
+          import time
+
+          root = os.environ['RUNNER_TEMP']
+          output = os.path.join(root, 'results')
+          binaries = {
+              'base': os.path.join(root, 'bin', 'cargo-base'),
+              '17296': os.path.join(root, 'bin', 'cargo-17296'),
+          }
+          env = os.environ.copy()
+          env.update({
+              'RUSTUP_TOOLCHAIN': '1.97.0',
+              'CARGO_HOME': os.path.join(root, 'cargo-home'),
+              'CARGO_NET_OFFLINE': 'true',
+              'CARGO_TERM_COLOR': 'never',
+          })
+
+          rows = []
+          pairs = 20
+          for pair in range(pairs):
+              order = ('base', '17296') if pair % 2 == 0 else ('17296', 'base')
+              for position, variant in enumerate(order):
+                  start = time.perf_counter_ns()
+                  result = subprocess.run(
+                      [binaries[variant], 'metadata', '--format-version', '1', '--locked', '--offline'],
+                      env=env,
+                      stdout=subprocess.DEVNULL,
+                      stderr=subprocess.PIPE,
+                      text=True,
+                  )
+                  elapsed_ms = (time.perf_counter_ns() - start) / 1_000_000
+                  if result.returncode:
+                      raise SystemExit(f'{variant} failed: {result.stderr[-6000:]}')
+                  rows.append({'pair': pair, 'position': position, 'variant': variant, 'elapsed_ms': elapsed_ms})
+                  print(f'pair={pair:02d} position={position} variant={variant} elapsed_ms={elapsed_ms:.3f}')
+
+          with open(os.path.join(output, 'wall-runs.csv'), 'w', newline='') as f:
+              writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+              writer.writeheader()
+              writer.writerows(rows)
+
+          summary = {}
+          for variant in binaries:
+              samples = [r['elapsed_ms'] for r in rows if r['variant'] == variant]
+              summary[variant] = {
+                  'n': len(samples),
+                  'mean_ms': statistics.mean(samples),
+                  'median_ms': statistics.median(samples),
+                  'stdev_ms': statistics.stdev(samples),
+                  'min_ms': min(samples),
+                  'max_ms': max(samples),
+              }
+          base = summary['base']['median_ms']
+          changed = summary['17296']['median_ms']
+          summary['comparison'] = {
+              'median_difference_ms_base_minus_17296': base - changed,
+              'median_improvement_percent': (base - changed) / base * 100,
+              'median_speedup_ratio': base / changed,
+          }
+          with open(os.path.join(output, 'wall-summary.json'), 'w') as f:
+              json.dump(summary, f, indent=2, sort_keys=True)
+          print(json.dumps(summary, indent=2, sort_keys=True))
+          PY
+
+      - name: Capture Cargo profiling traces
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/zed"
+          python3 - <<'PY'
+          import glob
+          import json
+          import os
+          import subprocess
+          import time
+
+          root = os.environ['RUNNER_TEMP']
+          output = os.path.join(root, 'results')
+          binaries = {
+              'base': os.path.join(root, 'bin', 'cargo-base'),
+              '17296': os.path.join(root, 'bin', 'cargo-17296'),
+          }
+          env = os.environ.copy()
+          env.update({
+              'RUSTUP_TOOLCHAIN': '1.97.0',
+              'CARGO_HOME': os.path.join(root, 'cargo-home'),
+              'CARGO_NET_OFFLINE': 'true',
+              'CARGO_TERM_COLOR': 'never',
+              'CARGO_LOG_PROFILE': 'true',
+              'CARGO_LOG_PROFILE_CAPTURE_ARGS': 'true',
+          })
+
+          rows = []
+          for variant, binary in binaries.items():
+              for run in range(3):
+                  for old in glob.glob('trace-*.json'):
+                      os.remove(old)
+                  start = time.perf_counter_ns()
+                  result = subprocess.run(
+                      [binary, 'metadata', '--format-version', '1', '--locked', '--offline'],
+                      env=env,
+                      stdout=subprocess.DEVNULL,
+                      stderr=subprocess.PIPE,
+                      text=True,
+                  )
+                  wall_ms = (time.perf_counter_ns() - start) / 1_000_000
+                  if result.returncode:
+                      raise SystemExit(f'profile {variant} failed: {result.stderr[-6000:]}')
+                  traces = glob.glob('trace-*.json')
+                  if len(traces) != 1:
+                      raise SystemExit(f'expected one trace, got {traces}')
+                  dest = os.path.join(output, f'trace-{variant}-{run}.json')
+                  os.replace(traces[0], dest)
+                  rows.append({'variant': variant, 'run': run, 'wall_ms': wall_ms})
+                  print(f'profile variant={variant} run={run} wall_ms={wall_ms:.3f}')
+
+          with open(os.path.join(output, 'profile-wall.json'), 'w') as f:
+              json.dump(rows, f, indent=2)
+          PY
+
+      - name: Write summary
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          root = os.environ['RUNNER_TEMP']
+          with open(os.path.join(root, 'results', 'wall-summary.json')) as f:
+              s = json.load(f)
+          report = f'''## cargo#14395 / cargo#17296 Zed experiment
+
+          - upstream Cargo: `{os.environ['UPSTREAM_SHA']}`
+          - cargo#17296 head rebased onto upstream: `{os.environ['PR_17296_SHA']}`
+          - Zed: `{os.environ['ZED_SHA']}`
+          - command: `cargo metadata --format-version 1 --locked --offline`
+
+          | variant | median ms | mean ms | stdev ms |
+          |---|---:|---:|---:|
+          | upstream | {s['base']['median_ms']:.3f} | {s['base']['mean_ms']:.3f} | {s['base']['stdev_ms']:.3f} |
+          | cargo#17296 | {s['17296']['median_ms']:.3f} | {s['17296']['mean_ms']:.3f} | {s['17296']['stdev_ms']:.3f} |
+
+          median delta: **{s['comparison']['median_difference_ms_base_minus_17296']:.3f} ms**  
+          median improvement: **{s['comparison']['median_improvement_percent']:.2f}%**
+          '''
+          print(report)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write(report)
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-parsing-experiment
+          path: ${{ runner.temp }}/results
+          if-no-files-found: error
+          retention-days: 30
