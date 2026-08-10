@@ -1,0 +1,123 @@
+diff --git a/src/workspace/parser/mod.rs b/src/workspace/parser/mod.rs
+index cb51fe36f..000000000 100644
+--- a/src/workspace/parser/mod.rs
++++ b/src/workspace/parser/mod.rs
+@@ -40,7 +40,7 @@ use crate::workspace::{
+ use crate::workspace::{Dependency, Manifest, Package, PackageId, Summary, Target};
+ use crate::workspace::{Edition, EitherManifest, Feature, Features, VirtualManifest, Workspace};
+ use crate::workspace::{
+-    GitReference, PackageIdSpec, SourceId, WorkspaceConfig, WorkspaceRootConfig,
++    GitReference, PackageIdSpec, SourceId, SourceKind, WorkspaceConfig, WorkspaceRootConfig,
+ };
+ 
+ mod embedded;
+@@ -73,12 +73,32 @@ pub fn read_manifest(
+ 
+     let is_embedded = is_embedded(path);
+     let contents = read_toml_string(path, is_embedded, gctx)?;
+-    let document = parse_document(&contents)
+-        .map_err(|e| emit_toml_diagnostic(e.into(), &contents, path, gctx))?;
+-    let original_toml = deserialize_toml(&document)
+-        .map_err(|e| emit_toml_diagnostic(e.into(), &contents, path, gctx))?;
+ 
+-    let document = make_document_owned(document);
++    let keep_document = is_embedded
++        || match source_id.kind() {
++            SourceKind::Path | SourceKind::LocalRegistry | SourceKind::Directory => true,
++            SourceKind::Git(_) | SourceKind::Registry | SourceKind::SparseRegistry => false,
++        };
++    let cache_experiment = std::env::var_os("CARGO_MANIFEST_CACHE_EXPERIMENT").is_some();
++    let (original_toml, document) = if keep_document {
++        let document = parse_document(&contents)
++            .map_err(|e| emit_toml_diagnostic(e.into(), &contents, path, gctx))?;
++        let original_toml = deserialize_toml(toml::de::Deserializer::from(document.clone()))
++            .map_err(|e| emit_toml_diagnostic(e.into(), &contents, path, gctx))?;
++        (original_toml, Some(make_document_owned(document)))
++    } else if cache_experiment {
++        let original_toml = deserialize_cached_toml(&contents, gctx)
++            .map_err(|e| emit_toml_diagnostic(e.into(), &contents, path, gctx))?;
++        (original_toml, None)
++    } else {
++        let deserializer = toml::de::Deserializer::parse(&contents)
++            .map_err(|e| emit_toml_diagnostic(e.into(), &contents, path, gctx))?;
++        let original_toml = deserialize_toml(deserializer)
++            .map_err(|e| emit_toml_diagnostic(e.into(), &contents, path, gctx))?;
++        (original_toml, None)
++    };
+ 
+     let mut manifest = (|| {
+         let empty = Vec::new();
+@@ -105,7 +125,7 @@ pub fn read_manifest(
+         if normalized_toml.package().is_some() {
+             to_real_manifest(
+                 Some(contents),
+-                Some(document),
++                document,
+                 original_toml,
+                 normalized_toml,
+                 features,
+@@ -122,7 +142,7 @@ pub fn read_manifest(
+             assert!(!is_embedded);
+             to_virtual_manifest(
+                 Some(contents),
+-                Some(document),
++                document,
+                 original_toml,
+                 normalized_toml,
+                 features,
+@@ -191,10 +211,58 @@ fn parse_document(contents: &str) -> Result<toml::Spanned<toml::de::DeTable<'_>>
+ 
+ #[tracing::instrument(skip_all)]
+ fn deserialize_toml(
+-    document: &toml::Spanned<toml::de::DeTable<'_>>,
++    deserializer: toml::de::Deserializer<'_>,
+ ) -> Result<manifest::TomlManifest, toml::de::Error> {
+     let mut unused = BTreeSet::new();
+-    let deserializer = toml::de::Deserializer::from(document.clone());
+     let mut document: manifest::TomlManifest = serde_ignored::deserialize(deserializer, |path| {
+         let mut key = String::new();
+         stringify(&mut key, &path);
+@@ -204,6 +272,48 @@ fn deserialize_toml(
+     Ok(document)
+ }
+ 
++#[derive(serde::Serialize, serde::Deserialize)]
++struct CachedTomlManifest {
++    manifest: manifest::TomlManifest,
++    unused_keys: BTreeSet<String>,
++}
++
++#[tracing::instrument(skip_all)]
++fn deserialize_cached_toml(
++    contents: &str,
++    gctx: &GlobalContext,
++) -> Result<manifest::TomlManifest, toml::de::Error> {
++    let hash = blake3::hash(contents.as_bytes()).to_hex().to_string();
++    let cache_dir = gctx.home().join("manifest-cache-experiment");
++    let cache_file = cache_dir.join(format!("{hash}.json"));
++
++    if let Ok(bytes) = std::fs::read(cache_file.as_path_unlocked()) {
++        if let Ok(mut cached) = serde_json::from_slice::<CachedTomlManifest>(&bytes) {
++            cached.manifest._unused_keys = cached.unused_keys;
++            return Ok(cached.manifest);
++        }
++    }
++
++    let deserializer = toml::de::Deserializer::parse(contents)?;
++    let manifest = deserialize_toml(deserializer)?;
++
++    let cached = CachedTomlManifest {
++        unused_keys: manifest._unused_keys.clone(),
++        manifest: manifest.clone(),
++    };
++    if let Ok(bytes) = serde_json::to_vec(&cached) {
++        if std::fs::create_dir_all(cache_dir.as_path_unlocked()).is_ok() {
++            let _ = std::fs::write(cache_file.as_path_unlocked(), bytes);
++        }
++    }
++
++    Ok(manifest)
++}
++
+ fn stringify(dst: &mut String, path: &serde_ignored::Path<'_>) {
+     use serde_ignored::Path;
