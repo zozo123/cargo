@@ -1,0 +1,362 @@
+name: Manifest parsing E2E experiment
+
+on:
+  push:
+    branches:
+      - experiment/14395-manifest-cache-e2e
+    paths:
+      - .github/workflows/manifest-parsing-e2e.yml
+      - .github/manifest-parsing-experiment/**
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    if: github.repository == 'zozo123/cargo'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      UPSTREAM_SHA: 9184583d2dc29ac1e23c6304f7281fd3941bb1bb
+      ZED_SHA: 5e03f2d387e629237c10a4e4fed881b64abd8fea
+      CARGO_TERM_COLOR: never
+      RUST_BACKTRACE: 1
+
+    steps:
+      - name: Checkout experiment harness
+        uses: actions/checkout@v4
+        with:
+          ref: experiment/14395-manifest-cache-e2e
+          fetch-depth: 1
+
+      - name: Record runner
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/results" "$RUNNER_TEMP/bin"
+          {
+            echo "date_utc=$(date -u +%FT%TZ)"
+            echo "upstream_sha=$UPSTREAM_SHA"
+            echo "zed_sha=$ZED_SHA"
+            echo "os=$(uname -a)"
+            echo "cpus=$(nproc)"
+            echo "memory_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
+            lscpu
+            df -h
+          } | tee "$RUNNER_TEMP/results/system.txt"
+
+      - name: Install Rust toolchains
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup run 1.97.0 rustc --version --verbose | tee "$RUNNER_TEMP/results/rust-cargo-build.txt"
+          rustup run 1.95.0 rustc --version --verbose | tee "$RUNNER_TEMP/results/rust-zed.txt"
+
+      - name: Build upstream, cargo#17296, and cache prototype
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git init "$RUNNER_TEMP/cargo-src"
+          cd "$RUNNER_TEMP/cargo-src"
+          git remote add upstream https://github.com/rust-lang/cargo.git
+          git fetch --depth 1 upstream "$UPSTREAM_SHA"
+          git branch upstream-base FETCH_HEAD
+
+          git worktree add --detach "$RUNNER_TEMP/cargo-base" upstream-base
+          git worktree add --detach "$RUNNER_TEMP/cargo-17296" upstream-base
+          git worktree add --detach "$RUNNER_TEMP/cargo-cache" upstream-base
+
+          curl -L --fail --retry 3 \
+            https://github.com/rust-lang/cargo/pull/17296.diff \
+            -o "$RUNNER_TEMP/17296.diff"
+          cd "$RUNNER_TEMP/cargo-17296"
+          git apply --include='src/workspace/parser/mod.rs' "$RUNNER_TEMP/17296.diff"
+          git diff --check
+          git diff -- src/workspace/parser/mod.rs > "$RUNNER_TEMP/results/17296-on-current.diff"
+
+          cd "$RUNNER_TEMP/cargo-cache"
+          git apply "$GITHUB_WORKSPACE/.github/manifest-parsing-experiment/cache-prototype.patch"
+          git diff --check
+          git diff -- src/workspace/parser/mod.rs > "$RUNNER_TEMP/results/cache-prototype.diff"
+
+          CARGO_TARGET_DIR="$RUNNER_TEMP/cargo-base-target" \
+            cargo +1.97.0 build --release --locked --bin cargo \
+            --manifest-path "$RUNNER_TEMP/cargo-base/Cargo.toml"
+          cp "$RUNNER_TEMP/cargo-base-target/release/cargo" "$RUNNER_TEMP/bin/cargo-base"
+
+          CARGO_TARGET_DIR="$RUNNER_TEMP/cargo-17296-target" \
+            cargo +1.97.0 build --release --locked --bin cargo \
+            --manifest-path "$RUNNER_TEMP/cargo-17296/Cargo.toml"
+          cp "$RUNNER_TEMP/cargo-17296-target/release/cargo" "$RUNNER_TEMP/bin/cargo-17296"
+
+          CARGO_TARGET_DIR="$RUNNER_TEMP/cargo-cache-target" \
+            cargo +1.97.0 build --release --locked --bin cargo \
+            --manifest-path "$RUNNER_TEMP/cargo-cache/Cargo.toml"
+          cp "$RUNNER_TEMP/cargo-cache-target/release/cargo" "$RUNNER_TEMP/bin/cargo-cache"
+
+          chmod +x "$RUNNER_TEMP/bin/cargo-base" "$RUNNER_TEMP/bin/cargo-17296" "$RUNNER_TEMP/bin/cargo-cache"
+          "$RUNNER_TEMP/bin/cargo-base" --version --verbose | tee "$RUNNER_TEMP/results/cargo-base-version.txt"
+          "$RUNNER_TEMP/bin/cargo-17296" --version --verbose | tee "$RUNNER_TEMP/results/cargo-17296-version.txt"
+          "$RUNNER_TEMP/bin/cargo-cache" --version --verbose | tee "$RUNNER_TEMP/results/cargo-cache-version.txt"
+          sha256sum "$RUNNER_TEMP/bin/"cargo-* | tee "$RUNNER_TEMP/results/cargo-binaries.sha256"
+
+          rm -rf "$RUNNER_TEMP/cargo-base-target" "$RUNNER_TEMP/cargo-17296-target" "$RUNNER_TEMP/cargo-cache-target"
+          df -h | tee -a "$RUNNER_TEMP/results/system.txt"
+
+      - name: Checkout pinned Zed and prime source data
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git init "$RUNNER_TEMP/zed"
+          cd "$RUNNER_TEMP/zed"
+          git remote add origin https://github.com/zed-industries/zed.git
+          git fetch --depth 1 origin "$ZED_SHA"
+          git checkout --detach FETCH_HEAD
+          git rev-parse HEAD | tee "$RUNNER_TEMP/results/zed-commit.txt"
+
+          export RUSTUP_TOOLCHAIN=1.95.0
+          export CARGO_HOME="$RUNNER_TEMP/cargo-home"
+          "$RUNNER_TEMP/bin/cargo-base" fetch --locked
+          "$RUNNER_TEMP/bin/cargo-base" metadata --format-version 1 --locked --offline >/dev/null
+          "$RUNNER_TEMP/bin/cargo-17296" metadata --format-version 1 --locked --offline >/dev/null
+          CARGO_MANIFEST_CACHE_EXPERIMENT=1 \
+            "$RUNNER_TEMP/bin/cargo-cache" metadata --format-version 1 --locked --offline >/dev/null
+
+          find "$CARGO_HOME/git/checkouts" "$CARGO_HOME/registry/src" -name Cargo.toml -type f 2>/dev/null \
+            -printf '%s\n' | awk '{n++; bytes += $1} END {printf "source_manifests=%d\nsource_manifest_bytes=%d\n", n, bytes}' \
+            | tee "$RUNNER_TEMP/results/source-manifests.txt"
+          find "$CARGO_HOME/manifest-cache-experiment" -type f 2>/dev/null -printf '%s\n' \
+            | awk '{n++; bytes += $1} END {printf "cache_entries=%d\ncache_bytes=%d\n", n, bytes}' \
+            | tee "$RUNNER_TEMP/results/cache-footprint.txt"
+
+      - name: Verify metadata equivalence
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/zed"
+          export RUSTUP_TOOLCHAIN=1.95.0
+          export CARGO_HOME="$RUNNER_TEMP/cargo-home"
+          export CARGO_NET_OFFLINE=true
+
+          "$RUNNER_TEMP/bin/cargo-base" metadata --format-version 1 --locked --offline \
+            > "$RUNNER_TEMP/results/metadata-base.json"
+          "$RUNNER_TEMP/bin/cargo-17296" metadata --format-version 1 --locked --offline \
+            > "$RUNNER_TEMP/results/metadata-17296.json"
+
+          rm -rf "$CARGO_HOME/manifest-cache-experiment"
+          CARGO_MANIFEST_CACHE_EXPERIMENT=1 \
+            "$RUNNER_TEMP/bin/cargo-cache" metadata --format-version 1 --locked --offline \
+            > "$RUNNER_TEMP/results/metadata-cache-miss.json"
+          CARGO_MANIFEST_CACHE_EXPERIMENT=1 \
+            "$RUNNER_TEMP/bin/cargo-cache" metadata --format-version 1 --locked --offline \
+            > "$RUNNER_TEMP/results/metadata-cache-hit.json"
+
+          python3 - <<'PY'
+          import json, os, hashlib
+          root = os.environ['RUNNER_TEMP']
+          result = os.path.join(root, 'results')
+          names = ['base', '17296', 'cache-miss', 'cache-hit']
+          docs = {}
+          summary = {}
+          for name in names:
+              path = os.path.join(result, f'metadata-{name}.json')
+              raw = open(path, 'rb').read()
+              docs[name] = json.loads(raw)
+              summary[name] = {
+                  'sha256': hashlib.sha256(raw).hexdigest(),
+                  'packages': len(docs[name].get('packages', [])),
+                  'workspace_members': len(docs[name].get('workspace_members', [])),
+              }
+          base = docs['base']
+          for name in names[1:]:
+              if docs[name] != base:
+                  raise SystemExit(f'metadata semantic mismatch: base vs {name}')
+          summary['all_semantically_equal'] = True
+          with open(os.path.join(result, 'metadata-equivalence.json'), 'w') as f:
+              json.dump(summary, f, indent=2, sort_keys=True)
+          print(json.dumps(summary, indent=2, sort_keys=True))
+          PY
+
+      - name: Measure steady-state Zed metadata
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/zed"
+          python3 - <<'PY'
+          import csv, json, os, random, statistics, subprocess, time
+
+          root = os.environ['RUNNER_TEMP']
+          output = os.path.join(root, 'results')
+          binaries = {
+              'base': os.path.join(root, 'bin', 'cargo-base'),
+              '17296': os.path.join(root, 'bin', 'cargo-17296'),
+              'cache-hit': os.path.join(root, 'bin', 'cargo-cache'),
+          }
+          env0 = os.environ.copy()
+          env0.update({
+              'RUSTUP_TOOLCHAIN': '1.95.0',
+              'CARGO_HOME': os.path.join(root, 'cargo-home'),
+              'CARGO_NET_OFFLINE': 'true',
+              'CARGO_TERM_COLOR': 'never',
+          })
+          orders = [
+              ('base', '17296', 'cache-hit'),
+              ('17296', 'cache-hit', 'base'),
+              ('cache-hit', 'base', '17296'),
+              ('base', 'cache-hit', '17296'),
+              ('cache-hit', '17296', 'base'),
+              ('17296', 'base', 'cache-hit'),
+          ]
+          rows = []
+          rounds = 30
+          for round_no in range(rounds):
+              order = orders[round_no % len(orders)]
+              for position, variant in enumerate(order):
+                  env = env0.copy()
+                  if variant == 'cache-hit':
+                      env['CARGO_MANIFEST_CACHE_EXPERIMENT'] = '1'
+                  start = time.perf_counter_ns()
+                  p = subprocess.run(
+                      [binaries[variant], 'metadata', '--format-version', '1', '--locked', '--offline'],
+                      env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                  )
+                  elapsed_ms = (time.perf_counter_ns() - start) / 1_000_000
+                  if p.returncode:
+                      raise SystemExit(f'{variant} failed: {p.stderr[-6000:]}')
+                  rows.append({'round': round_no, 'position': position, 'variant': variant, 'elapsed_ms': elapsed_ms})
+                  print(f'round={round_no:02d} pos={position} variant={variant} ms={elapsed_ms:.3f}')
+
+          with open(os.path.join(output, 'steady-runs.csv'), 'w', newline='') as f:
+              w = csv.DictWriter(f, fieldnames=rows[0].keys()); w.writeheader(); w.writerows(rows)
+
+          def percentile(values, q):
+              xs = sorted(values); pos = (len(xs)-1)*q; lo=int(pos); hi=min(lo+1,len(xs)-1)
+              return xs[lo] + (xs[hi]-xs[lo])*(pos-lo)
+
+          summary = {}
+          for variant in binaries:
+              xs = [r['elapsed_ms'] for r in rows if r['variant'] == variant]
+              summary[variant] = {
+                  'n': len(xs), 'mean_ms': statistics.mean(xs), 'median_ms': statistics.median(xs),
+                  'stdev_ms': statistics.stdev(xs), 'min_ms': min(xs), 'p95_ms': percentile(xs, .95), 'max_ms': max(xs),
+              }
+
+          per_round = {}
+          for r in rows:
+              per_round.setdefault(r['round'], {})[r['variant']] = r['elapsed_ms']
+          comparisons = [('base','17296'), ('base','cache-hit'), ('17296','cache-hit')]
+          random.seed(14395)
+          for a,b in comparisons:
+              diffs = [v[a]-v[b] for v in per_round.values()]
+              boots=[]
+              for _ in range(20000):
+                  boots.append(statistics.mean(diffs[random.randrange(len(diffs))] for _ in diffs))
+              key=f'{a}_minus_{b}'
+              summary[key] = {
+                  'paired_mean_difference_ms': statistics.mean(diffs),
+                  'paired_mean_difference_95ci_ms': [percentile(boots,.025), percentile(boots,.975)],
+                  'median_speedup_ratio': summary[a]['median_ms']/summary[b]['median_ms'],
+                  'median_improvement_percent': (summary[a]['median_ms']-summary[b]['median_ms'])/summary[a]['median_ms']*100,
+              }
+          with open(os.path.join(output, 'steady-summary.json'), 'w') as f:
+              json.dump(summary, f, indent=2, sort_keys=True)
+          print(json.dumps(summary, indent=2, sort_keys=True))
+          PY
+
+      - name: Measure cache-miss cost
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/zed"
+          python3 - <<'PY'
+          import csv, json, os, statistics, subprocess, time
+          root=os.environ['RUNNER_TEMP']; output=os.path.join(root,'results')
+          env0=os.environ.copy(); env0.update({'RUSTUP_TOOLCHAIN':'1.95.0','CARGO_HOME':os.path.join(root,'cargo-home'),'CARGO_NET_OFFLINE':'true','CARGO_TERM_COLOR':'never'})
+          bins={'17296':os.path.join(root,'bin','cargo-17296'),'cache-miss':os.path.join(root,'bin','cargo-cache')}
+          rows=[]
+          for pair in range(15):
+              order=('17296','cache-miss') if pair%2==0 else ('cache-miss','17296')
+              for pos,variant in enumerate(order):
+                  env=env0.copy()
+                  if variant=='cache-miss':
+                      import shutil
+                      shutil.rmtree(os.path.join(root,'cargo-home','manifest-cache-experiment'), ignore_errors=True)
+                      env['CARGO_MANIFEST_CACHE_EXPERIMENT']='1'
+                  start=time.perf_counter_ns()
+                  p=subprocess.run([bins[variant],'metadata','--format-version','1','--locked','--offline'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True)
+                  ms=(time.perf_counter_ns()-start)/1_000_000
+                  if p.returncode: raise SystemExit(f'{variant} failed: {p.stderr[-6000:]}')
+                  rows.append({'pair':pair,'position':pos,'variant':variant,'elapsed_ms':ms}); print(f'pair={pair:02d} variant={variant} ms={ms:.3f}')
+          with open(os.path.join(output,'miss-runs.csv'),'w',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=rows[0].keys());w.writeheader();w.writerows(rows)
+          s={}
+          for v in bins:
+              xs=[r['elapsed_ms'] for r in rows if r['variant']==v]
+              s[v]={'n':len(xs),'mean_ms':statistics.mean(xs),'median_ms':statistics.median(xs),'stdev_ms':statistics.stdev(xs),'min_ms':min(xs),'max_ms':max(xs)}
+          s['comparison']={'median_overhead_ms_cache_miss_minus_17296':s['cache-miss']['median_ms']-s['17296']['median_ms'],'median_overhead_percent':(s['cache-miss']['median_ms']-s['17296']['median_ms'])/s['17296']['median_ms']*100}
+          with open(os.path.join(output,'miss-summary.json'),'w') as f:json.dump(s,f,indent=2,sort_keys=True)
+          print(json.dumps(s,indent=2,sort_keys=True))
+          PY
+
+      - name: Capture and aggregate Cargo profiles
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/zed"
+          python3 - <<'PY'
+          import glob, json, os, statistics, subprocess, time
+          root=os.environ['RUNNER_TEMP']; output=os.path.join(root,'results')
+          bins={'base':os.path.join(root,'bin','cargo-base'),'17296':os.path.join(root,'bin','cargo-17296'),'cache-hit':os.path.join(root,'bin','cargo-cache')}
+          env0=os.environ.copy();env0.update({'RUSTUP_TOOLCHAIN':'1.95.0','CARGO_HOME':os.path.join(root,'cargo-home'),'CARGO_NET_OFFLINE':'true','CARGO_TERM_COLOR':'never','CARGO_LOG_PROFILE':'true','CARGO_LOG_PROFILE_CAPTURE_ARGS':'true'})
+          rows=[]
+          for run in range(5):
+              for variant,binary in bins.items():
+                  env=env0.copy()
+                  if variant=='cache-hit':env['CARGO_MANIFEST_CACHE_EXPERIMENT']='1'
+                  for old in glob.glob('trace-*.json'): os.remove(old)
+                  start=time.perf_counter_ns()
+                  p=subprocess.run([binary,'metadata','--format-version','1','--locked','--offline'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True)
+                  wall=(time.perf_counter_ns()-start)/1_000_000
+                  if p.returncode:raise SystemExit(f'profile {variant} failed: {p.stderr[-6000:]}')
+                  traces=glob.glob('trace-*.json')
+                  if len(traces)!=1:raise SystemExit(f'expected one trace for {variant}, got {traces}')
+                  dst=os.path.join(output,f'trace-{variant}-{run}.json');os.replace(traces[0],dst)
+                  payload=json.load(open(dst)); events=payload.get('traceEvents',payload if isinstance(payload,list) else [])
+                  sums={'read_manifest_ms':0.0,'parse_document_ms':0.0,'deserialize_toml_ms':0.0,'deserialize_cached_toml_ms':0.0}
+                  counts={k.replace('_ms','_count'):0 for k in sums}
+                  for e in events:
+                      if not isinstance(e,dict) or e.get('ph')!='X' or not isinstance(e.get('dur'),(int,float)):continue
+                      name=str(e.get('name','')).split('::')[-1]
+                      for target in ['read_manifest','parse_document','deserialize_toml','deserialize_cached_toml']:
+                          if name==target:
+                              sums[target+'_ms']+=float(e['dur'])/1000.0;counts[target+'_count']+=1
+                  row={'run':run,'variant':variant,'wall_ms':wall,**sums,**counts};rows.append(row);print(row)
+          json.dump(rows,open(os.path.join(output,'profile-summary.json'),'w'),indent=2)
+          PY
+
+      - name: Write experiment summary
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import json, os
+          root=os.environ['RUNNER_TEMP']; r=os.path.join(root,'results')
+          steady=json.load(open(os.path.join(r,'steady-summary.json')))
+          miss=json.load(open(os.path.join(r,'miss-summary.json')))
+          equiv=json.load(open(os.path.join(r,'metadata-equivalence.json')))
+          report=f'''## cargo#14395 manifest parsing experiment\n\n- upstream Cargo: `{os.environ['UPSTREAM_SHA']}`\n- Zed: `{os.environ['ZED_SHA']}`\n- command: `cargo metadata --format-version 1 --locked --offline`\n- semantic metadata equality: **{equiv['all_semantically_equal']}**\n\n### Steady state\n\n| variant | median ms | mean ms | stdev ms | p95 ms |\n|---|---:|---:|---:|---:|\n| upstream | {steady['base']['median_ms']:.3f} | {steady['base']['mean_ms']:.3f} | {steady['base']['stdev_ms']:.3f} | {steady['base']['p95_ms']:.3f} |\n| cargo#17296 parse-only | {steady['17296']['median_ms']:.3f} | {steady['17296']['mean_ms']:.3f} | {steady['17296']['stdev_ms']:.3f} | {steady['17296']['p95_ms']:.3f} |\n| cache hit | {steady['cache-hit']['median_ms']:.3f} | {steady['cache-hit']['mean_ms']:.3f} | {steady['cache-hit']['stdev_ms']:.3f} | {steady['cache-hit']['p95_ms']:.3f} |\n\n- upstream -> 17296 median improvement: **{steady['base_minus_17296']['median_improvement_percent']:.2f}%**\n- upstream -> cache-hit median improvement: **{steady['base_minus_cache-hit']['median_improvement_percent']:.2f}%**\n- 17296 -> cache-hit median improvement: **{steady['17296_minus_cache-hit']['median_improvement_percent']:.2f}%**\n- cache miss overhead vs 17296: **{miss['comparison']['median_overhead_ms_cache_miss_minus_17296']:.3f} ms ({miss['comparison']['median_overhead_percent']:.2f}%)**\n\nRaw runs, bootstrap confidence intervals, cache footprint, metadata output and Chrome traces are attached as the workflow artifact.\n'''
+          print(report)
+          open(os.environ['GITHUB_STEP_SUMMARY'],'a').write(report)
+          open(os.path.join(r,'README.md'),'w').write(report)
+          PY
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-parsing-e2e
+          path: ${{ runner.temp }}/results
+          if-no-files-found: warn
+          retention-days: 30
