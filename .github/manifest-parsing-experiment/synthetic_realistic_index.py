@@ -84,7 +84,16 @@ def index_stats(roots):
     total_bytes = 0
     for p in files:
         total_bytes += p.stat().st_size
-        for line in p.read_text().splitlines():
+        lines = p.read_text().splitlines()
+        if not lines or lines[0] != "cargo-manifest-index-v2":
+            raise SystemExit(f"invalid index header: {p}")
+        if len(lines) < 2 or not lines[-1].startswith("cargo-manifest-index-end\t"):
+            raise SystemExit(f"invalid index footer: {p}")
+        body = lines[1:-1]
+        expected = int(lines[-1].split("\t", 1)[1])
+        if expected != len(body):
+            raise SystemExit(f"invalid index count: {p} expected={expected} body={len(body)}")
+        for line in body:
             if not line.strip():
                 continue
             entries += 1
@@ -147,8 +156,6 @@ def run_case(n, u):
         "RUSTUP_TOOLCHAIN": "1.95.0",
     })
 
-    # Fetch/lock first. Then build the warm index from Cargo's existing full
-    # discovery in an untimed process. This does not use resolved metadata.
     run([str(base), "generate-lockfile"], cwd=c, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     build_env = env.copy()
     build_env.update({"CARGO_NET_OFFLINE": "true", "CARGO_GIT_MANIFEST_INDEX_BUILD": "1"})
