@@ -27,10 +27,7 @@ jobs:
         with:
           ref: experiment/14395-grid-e2e
           fetch-depth: 1
-
-      - name: Install Cargo build toolchain
-        run: rustup toolchain install 1.97.0 --profile minimal
-
+      - run: rustup toolchain install 1.97.0 --profile minimal
       - name: Build frozen experiment variants
         shell: bash
         run: |
@@ -48,6 +45,8 @@ jobs:
             git -C "$RUNNER_TEMP/cargo-src" worktree add --detach "$dir" upstream-base
             if [ "$mode" = cache-json ]; then
               git -C "$dir" apply "$GITHUB_WORKSPACE/.github/manifest-parsing-experiment/cache-prototype.patch"
+            elif [ "$mode" = oracle ]; then
+              python3 "$GITHUB_WORKSPACE/.github/manifest-parsing-experiment/make_oracle_variant.py" "$dir"
             elif [ "$mode" != base ]; then
               python3 "$GITHUB_WORKSPACE/.github/manifest-parsing-experiment/make_parser_variant.py" "$dir" "$mode"
             fi
@@ -70,9 +69,8 @@ jobs:
           build_variant hash-only hash-only
           build_variant hash-read-direct hash-read-direct
           build_variant cache-json cache-json
-
+          build_variant oracle oracle
           tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/variants.tgz" bin results
-
       - uses: actions/upload-artifact@v4
         with:
           name: manifest-grid-variants
@@ -96,50 +94,42 @@ jobs:
         with:
           name: manifest-grid-variants
           path: ${{ runner.temp }}
-      - name: Unpack and install runtime toolchain
-        run: |
-          tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/variants.tgz"
-          rustup toolchain install 1.95.0 --profile minimal
       - name: Prepare pinned Zed
         shell: bash
         run: |
           set -euxo pipefail
+          tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/variants.tgz"
+          rustup toolchain install 1.95.0 --profile minimal
           git init "$RUNNER_TEMP/zed"
           git -C "$RUNNER_TEMP/zed" remote add origin https://github.com/zed-industries/zed.git
           git -C "$RUNNER_TEMP/zed" fetch --depth 1 origin "$ZED_SHA"
           git -C "$RUNNER_TEMP/zed" checkout --detach FETCH_HEAD
-          export RUSTUP_TOOLCHAIN=1.95.0
-          export CARGO_HOME="$RUNNER_TEMP/cargo-home"
+          export RUSTUP_TOOLCHAIN=1.95.0 CARGO_HOME="$RUNNER_TEMP/cargo-home"
+          cd "$RUNNER_TEMP/zed"
           "$RUNNER_TEMP/bin/cargo-base" fetch --locked
           for v in base full git-only registry-only; do
             "$RUNNER_TEMP/bin/cargo-$v" metadata --format-version 1 --locked --offline > "$RUNNER_TEMP/meta-$v.json"
           done
           python3 - <<'PY'
           import json, os
-          r=os.environ['RUNNER_TEMP']
-          names=['base','full','git-only','registry-only']
+          r=os.environ['RUNNER_TEMP']; names=['base','full','git-only','registry-only']
           docs={n:json.load(open(f'{r}/meta-{n}.json')) for n in names}
-          for n in names[1:]:
-              assert docs[n] == docs['base'], n
-          print('metadata equivalent:', ', '.join(names))
+          assert all(docs[n] == docs['base'] for n in names[1:])
           PY
-      - name: Experiment 1 - source-kind attribution
+      - name: Source-kind attribution
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p "$RUNNER_TEMP/out"
-          export RUSTUP_TOOLCHAIN=1.95.0
-          export CARGO_HOME="$RUNNER_TEMP/cargo-home"
-          export CARGO_NET_OFFLINE=true
+          export RUSTUP_TOOLCHAIN=1.95.0 CARGO_HOME="$RUNNER_TEMP/cargo-home" CARGO_NET_OFFLINE=true
           export COMMAND_JSON='["metadata","--format-version","1","--locked","--offline"]'
           export VARIANTS_JSON="$(python3 - <<'PY'
           import json, os
-          r=os.environ['RUNNER_TEMP']
-          print(json.dumps({n:{'path':f'{r}/bin/cargo-{n}'} for n in ['base','full','git-only','registry-only']}))
+          r=os.environ['RUNNER_TEMP']; ns=['base','full','git-only','registry-only']
+          print(json.dumps({n:{'path':f'{r}/bin/cargo-{n}'} for n in ns}))
           PY
           )"
-          python3 .github/manifest-parsing-experiment/measure_variants.py \
-            "$RUNNER_TEMP/zed" "$RUNNER_TEMP/out/source-kind-${{ matrix.replica }}.json" 24
+          python3 .github/manifest-parsing-experiment/measure_variants.py "$RUNNER_TEMP/zed" "$RUNNER_TEMP/out/source-kind-${{ matrix.replica }}.json" 24
       - uses: actions/upload-artifact@v4
         with:
           name: source-kind-${{ matrix.replica }}
@@ -159,7 +149,7 @@ jobs:
         with:
           name: manifest-grid-variants
           path: ${{ runner.temp }}
-      - name: Prepare Zed and binaries
+      - name: Prepare Zed
         shell: bash
         run: |
           set -euxo pipefail
@@ -170,6 +160,7 @@ jobs:
           git -C "$RUNNER_TEMP/zed" fetch --depth 1 origin "$ZED_SHA"
           git -C "$RUNNER_TEMP/zed" checkout --detach FETCH_HEAD
           export RUSTUP_TOOLCHAIN=1.95.0 CARGO_HOME="$RUNNER_TEMP/cargo-home"
+          cd "$RUNNER_TEMP/zed"
           "$RUNNER_TEMP/bin/cargo-base" fetch --locked
           for v in base spanned-no-retain full; do
             "$RUNNER_TEMP/bin/cargo-$v" metadata --format-version 1 --locked --offline > "$RUNNER_TEMP/meta-$v.json"
@@ -180,7 +171,7 @@ jobs:
           d={n:json.load(open(f'{r}/meta-{n}.json')) for n in ns}
           assert all(d[n]==d['base'] for n in ns)
           PY
-      - name: Experiment 2 - parser work decomposition
+      - name: Parser work decomposition
         shell: bash
         run: |
           set -euxo pipefail
@@ -193,15 +184,12 @@ jobs:
           print(json.dumps({n:{'path':f'{r}/bin/cargo-{n}'} for n in ns}))
           PY
           )"
-          python3 .github/manifest-parsing-experiment/measure_variants.py \
-            "$RUNNER_TEMP/zed" "$RUNNER_TEMP/out/parser-work.json" 24
-
+          python3 .github/manifest-parsing-experiment/measure_variants.py "$RUNNER_TEMP/zed" "$RUNNER_TEMP/out/parser-work.json" 24
           cd "$RUNNER_TEMP/zed"
           for v in base spanned-no-retain full; do
             : > "$RUNNER_TEMP/out/rss-$v.txt"
             for i in 1 2 3 4 5; do
-              /usr/bin/time -v "$RUNNER_TEMP/bin/cargo-$v" metadata --format-version 1 --locked --offline >/dev/null \
-                2> "$RUNNER_TEMP/rss.tmp"
+              /usr/bin/time -v "$RUNNER_TEMP/bin/cargo-$v" metadata --format-version 1 --locked --offline >/dev/null 2> "$RUNNER_TEMP/rss.tmp"
               grep 'Maximum resident set size' "$RUNNER_TEMP/rss.tmp" >> "$RUNNER_TEMP/out/rss-$v.txt"
             done
           done
@@ -235,6 +223,7 @@ jobs:
           git -C "$RUNNER_TEMP/zed" fetch --depth 1 origin "$ZED_SHA"
           git -C "$RUNNER_TEMP/zed" checkout --detach FETCH_HEAD
           export RUSTUP_TOOLCHAIN=1.95.0 CARGO_HOME="$RUNNER_TEMP/cargo-home"
+          cd "$RUNNER_TEMP/zed"
           "$RUNNER_TEMP/bin/cargo-base" fetch --locked
           rm -rf "$CARGO_HOME/manifest-cache-experiment"
           CARGO_MANIFEST_CACHE_EXPERIMENT=1 "$RUNNER_TEMP/bin/cargo-cache-json" metadata --format-version 1 --locked --offline >/dev/null
@@ -248,7 +237,7 @@ jobs:
           d={n:json.load(open(f'{r}/meta-{n}.json')) for n in ns}
           assert all(d[n]==d['full'] for n in ns)
           PY
-      - name: Experiment 3 - cache overhead ablation
+      - name: Cache overhead ablation
         shell: bash
         run: |
           set -euxo pipefail
@@ -266,21 +255,86 @@ jobs:
           }))
           PY
           )"
-          python3 .github/manifest-parsing-experiment/measure_variants.py \
-            "$RUNNER_TEMP/zed" "$RUNNER_TEMP/out/cache-ablation.json" 20
-
-          find "$CARGO_HOME/manifest-cache-experiment" -type f -printf '%s\n' 2>/dev/null \
-            | awk '{n++;b+=$1} END {print "entries=" n; print "bytes=" b}' > "$RUNNER_TEMP/out/cache-footprint.txt"
+          python3 .github/manifest-parsing-experiment/measure_variants.py "$RUNNER_TEMP/zed" "$RUNNER_TEMP/out/cache-ablation.json" 20
+          find "$CARGO_HOME/manifest-cache-experiment" -type f -printf '%s\n' 2>/dev/null | awk '{n++;b+=$1} END {print "entries=" n; print "bytes=" b}' > "$RUNNER_TEMP/out/cache-footprint.txt"
+          cd "$RUNNER_TEMP/zed"
           if command -v strace >/dev/null; then
-            cd "$RUNNER_TEMP/zed"
-            strace -f -c "$RUNNER_TEMP/bin/cargo-full" metadata --format-version 1 --locked --offline >/dev/null \
-              2> "$RUNNER_TEMP/out/strace-full.txt" || true
-            CARGO_MANIFEST_CACHE_EXPERIMENT=1 strace -f -c "$RUNNER_TEMP/bin/cargo-cache-json" metadata --format-version 1 --locked --offline >/dev/null \
-              2> "$RUNNER_TEMP/out/strace-cache-json.txt" || true
+            strace -f -c "$RUNNER_TEMP/bin/cargo-full" metadata --format-version 1 --locked --offline >/dev/null 2> "$RUNNER_TEMP/out/strace-full.txt" || true
+            CARGO_MANIFEST_CACHE_EXPERIMENT=1 strace -f -c "$RUNNER_TEMP/bin/cargo-cache-json" metadata --format-version 1 --locked --offline >/dev/null 2> "$RUNNER_TEMP/out/strace-cache-json.txt" || true
           fi
       - uses: actions/upload-artifact@v4
         with:
           name: cache-ablation
+          path: ${{ runner.temp }}/out
+          retention-days: 30
+
+  oracle-index:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: experiment/14395-grid-e2e
+          fetch-depth: 1
+      - uses: actions/download-artifact@v4
+        with:
+          name: manifest-grid-variants
+          path: ${{ runner.temp }}
+      - name: Prepare Zed and oracle manifest roots
+        shell: bash
+        run: |
+          set -euxo pipefail
+          tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/variants.tgz"
+          rustup toolchain install 1.95.0 --profile minimal
+          git init "$RUNNER_TEMP/zed"
+          git -C "$RUNNER_TEMP/zed" remote add origin https://github.com/zed-industries/zed.git
+          git -C "$RUNNER_TEMP/zed" fetch --depth 1 origin "$ZED_SHA"
+          git -C "$RUNNER_TEMP/zed" checkout --detach FETCH_HEAD
+          export RUSTUP_TOOLCHAIN=1.95.0 CARGO_HOME="$RUNNER_TEMP/cargo-home"
+          cd "$RUNNER_TEMP/zed"
+          "$RUNNER_TEMP/bin/cargo-base" fetch --locked
+          "$RUNNER_TEMP/bin/cargo-base" metadata --format-version 1 --locked --offline > "$RUNNER_TEMP/base-meta.json"
+          python3 "$GITHUB_WORKSPACE/.github/manifest-parsing-experiment/write_oracle_from_metadata.py" "$RUNNER_TEMP/base-meta.json" "$RUNNER_TEMP/oracle-stats.json"
+          "$RUNNER_TEMP/bin/cargo-full" metadata --format-version 1 --locked --offline > "$RUNNER_TEMP/full-meta.json"
+          CARGO_GIT_MANIFEST_ORACLE=1 "$RUNNER_TEMP/bin/cargo-oracle" metadata --format-version 1 --locked --offline > "$RUNNER_TEMP/oracle-meta.json"
+          python3 - <<'PY'
+          import json,os
+          r=os.environ['RUNNER_TEMP']
+          b=json.load(open(f'{r}/base-meta.json'))
+          f=json.load(open(f'{r}/full-meta.json'))
+          o=json.load(open(f'{r}/oracle-meta.json'))
+          assert f == b
+          assert o == b
+          print('metadata equivalent; packages=', len(b['packages']), 'workspace_members=', len(b['workspace_members']))
+          PY
+      - name: Oracle upper-bound on pinned Zed
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          cp "$RUNNER_TEMP/oracle-stats.json" "$RUNNER_TEMP/out/oracle-stats.json"
+          export RUSTUP_TOOLCHAIN=1.95.0 CARGO_HOME="$RUNNER_TEMP/cargo-home" CARGO_NET_OFFLINE=true
+          export COMMAND_JSON='["metadata","--format-version","1","--locked","--offline"]'
+          export VARIANTS_JSON="$(python3 - <<'PY'
+          import json,os
+          r=os.environ['RUNNER_TEMP']
+          print(json.dumps({
+            'base': {'path':f'{r}/bin/cargo-base'},
+            'full': {'path':f'{r}/bin/cargo-full'},
+            'oracle': {'path':f'{r}/bin/cargo-oracle','env':{'CARGO_GIT_MANIFEST_ORACLE':'1'}},
+          }))
+          PY
+          )"
+          python3 .github/manifest-parsing-experiment/measure_variants.py "$RUNNER_TEMP/zed" "$RUNNER_TEMP/out/oracle-zed.json" 30
+          cd "$RUNNER_TEMP/zed"
+          if command -v strace >/dev/null; then
+            strace -f -c "$RUNNER_TEMP/bin/cargo-base" metadata --format-version 1 --locked --offline >/dev/null 2> "$RUNNER_TEMP/out/strace-base.txt" || true
+            CARGO_GIT_MANIFEST_ORACLE=1 strace -f -c "$RUNNER_TEMP/bin/cargo-oracle" metadata --format-version 1 --locked --offline >/dev/null 2> "$RUNNER_TEMP/out/strace-oracle.txt" || true
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oracle-index-zed
           path: ${{ runner.temp }}/out
           retention-days: 30
 
@@ -297,7 +351,7 @@ jobs:
         with:
           name: manifest-grid-variants
           path: ${{ runner.temp }}
-      - name: Experiment 4 - git source N/U scaling and pruned upper bound
+      - name: Git-source scaling, matched-tree control, and oracle upper bound
         shell: bash
         run: |
           set -euxo pipefail
@@ -308,6 +362,7 @@ jobs:
             "$RUNNER_TEMP/synthetic" \
             "$RUNNER_TEMP/bin/cargo-base" \
             "$RUNNER_TEMP/bin/cargo-full" \
+            "$RUNNER_TEMP/bin/cargo-oracle" \
             "$RUNNER_TEMP/out/synthetic-scaling.json"
       - uses: actions/upload-artifact@v4
         with:
