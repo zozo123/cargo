@@ -1,0 +1,251 @@
+name: Realistic git manifest index experiment
+
+on:
+  push:
+    branches:
+      - experiment/14395-realistic-index-e2e
+    paths:
+      - .github/workflows/realistic-git-index.yml
+      - .github/manifest-parsing-experiment/**
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_SHA: 9184583d2dc29ac1e23c6304f7281fd3941bb1bb
+  ZED_SHA: 5e03f2d387e629237c10a4e4fed881b64abd8fea
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    if: github.repository == 'zozo123/cargo'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: experiment/14395-realistic-index-e2e
+          fetch-depth: 1
+      - run: rustup toolchain install 1.97.0 --profile minimal
+      - name: Build frozen variants
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/bin" "$RUNNER_TEMP/results"
+          git init "$RUNNER_TEMP/cargo-src"
+          git -C "$RUNNER_TEMP/cargo-src" remote add upstream https://github.com/rust-lang/cargo.git
+          git -C "$RUNNER_TEMP/cargo-src" fetch --depth 1 upstream "$UPSTREAM_SHA"
+          git -C "$RUNNER_TEMP/cargo-src" branch upstream-base FETCH_HEAD
+
+          build_variant() {
+            name="$1"
+            dir="$RUNNER_TEMP/cargo-$name"
+            git -C "$RUNNER_TEMP/cargo-src" worktree add --detach "$dir" upstream-base
+            case "$name" in
+              base)
+                ;;
+              full)
+                python3 "$GITHUB_WORKSPACE/.github/manifest-parsing-experiment/make_parser_variant.py" "$dir" full
+                ;;
+              oracle)
+                python3 "$GITHUB_WORKSPACE/.github/manifest-parsing-experiment/make_oracle_variant.py" "$dir"
+                ;;
+              index)
+                python3 "$GITHUB_WORKSPACE/.github/manifest-parsing-experiment/make_realistic_index_variant.py" "$dir"
+                ;;
+              full-index)
+                python3 "$GITHUB_WORKSPACE/.github/manifest-parsing-experiment/make_parser_variant.py" "$dir" full
+                python3 "$GITHUB_WORKSPACE/.github/manifest-parsing-experiment/make_realistic_index_variant.py" "$dir"
+                ;;
+              *) exit 2 ;;
+            esac
+            git -C "$dir" diff --check
+            git -C "$dir" diff > "$RUNNER_TEMP/results/$name.diff"
+            CARGO_TARGET_DIR="$RUNNER_TEMP/shared-target" \
+              cargo +1.97.0 build --release --locked --bin cargo --manifest-path "$dir/Cargo.toml"
+            cp "$RUNNER_TEMP/shared-target/release/cargo" "$RUNNER_TEMP/bin/cargo-$name"
+            chmod +x "$RUNNER_TEMP/bin/cargo-$name"
+            "$RUNNER_TEMP/bin/cargo-$name" --version --verbose > "$RUNNER_TEMP/results/$name-version.txt"
+            sha256sum "$RUNNER_TEMP/bin/cargo-$name" >> "$RUNNER_TEMP/results/binaries.sha256"
+            git -C "$RUNNER_TEMP/cargo-src" worktree remove --force "$dir"
+          }
+
+          build_variant base
+          build_variant full
+          build_variant oracle
+          build_variant index
+          build_variant full-index
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/realistic-index-variants.tgz" bin results
+      - uses: actions/upload-artifact@v4
+        with:
+          name: realistic-index-variants
+          path: ${{ runner.temp }}/realistic-index-variants.tgz
+          retention-days: 30
+
+  zed-realistic:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        replica: [1, 2, 3]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: experiment/14395-realistic-index-e2e
+          fetch-depth: 1
+      - uses: actions/download-artifact@v4
+        with:
+          name: realistic-index-variants
+          path: ${{ runner.temp }}
+      - name: Prepare pinned Zed and build realistic index
+        shell: bash
+        run: |
+          set -euxo pipefail
+          tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/realistic-index-variants.tgz"
+          rustup toolchain install 1.95.0 --profile minimal
+          git init "$RUNNER_TEMP/zed"
+          git -C "$RUNNER_TEMP/zed" remote add origin https://github.com/zed-industries/zed.git
+          git -C "$RUNNER_TEMP/zed" fetch --depth 1 origin "$ZED_SHA"
+          git -C "$RUNNER_TEMP/zed" checkout --detach FETCH_HEAD
+          export RUSTUP_TOOLCHAIN=1.95.0 CARGO_HOME="$RUNNER_TEMP/cargo-home"
+          cd "$RUNNER_TEMP/zed"
+          "$RUNNER_TEMP/bin/cargo-base" fetch --locked
+          "$RUNNER_TEMP/bin/cargo-base" metadata --format-version 1 --locked --offline > "$RUNNER_TEMP/base-meta.json"
+
+          find "$CARGO_HOME/git/checkouts" -name .cargo-manifest-index-experiment -delete 2>/dev/null || true
+          CARGO_GIT_MANIFEST_INDEX_BUILD=1 \
+            "$RUNNER_TEMP/bin/cargo-index" metadata --format-version 1 --locked --offline > "$RUNNER_TEMP/index-build-meta.json"
+
+          python3 "$GITHUB_WORKSPACE/.github/manifest-parsing-experiment/write_oracle_from_metadata.py" \
+            "$RUNNER_TEMP/base-meta.json" "$RUNNER_TEMP/oracle-stats.json"
+
+          CARGO_GIT_MANIFEST_INDEX_USE=1 \
+            "$RUNNER_TEMP/bin/cargo-index" metadata --format-version 1 --locked --offline > "$RUNNER_TEMP/index-meta.json"
+          "$RUNNER_TEMP/bin/cargo-full" metadata --format-version 1 --locked --offline > "$RUNNER_TEMP/full-meta.json"
+          CARGO_GIT_MANIFEST_INDEX_USE=1 \
+            "$RUNNER_TEMP/bin/cargo-full-index" metadata --format-version 1 --locked --offline > "$RUNNER_TEMP/full-index-meta.json"
+          CARGO_GIT_MANIFEST_ORACLE=1 \
+            "$RUNNER_TEMP/bin/cargo-oracle" metadata --format-version 1 --locked --offline > "$RUNNER_TEMP/oracle-meta.json"
+
+          python3 - <<'PY'
+          import json, os, pathlib
+          r=pathlib.Path(os.environ['RUNNER_TEMP'])
+          names=['base','index-build','index','full','full-index','oracle']
+          docs={n:json.load(open(r/f'{n}-meta.json')) for n in names}
+          assert all(docs[n] == docs['base'] for n in names[1:]), [n for n in names[1:] if docs[n] != docs['base']]
+          roots=list((pathlib.Path(os.environ['CARGO_HOME'])/'git'/'checkouts').rglob('.cargo-ok'))
+          idx=list((pathlib.Path(os.environ['CARGO_HOME'])/'git'/'checkouts').rglob('.cargo-manifest-index-experiment'))
+          assert idx, 'no realistic index files were generated'
+          entries=[]
+          for p in idx:
+              entries.extend(line for line in p.read_text().splitlines() if line.strip())
+          stats={
+              'checkout_roots':len(roots), 'index_files':len(idx), 'index_entries':len(entries),
+              'index_unique_names':len({x.split('\t',1)[0] for x in entries}),
+              'index_bytes':sum(p.stat().st_size for p in idx),
+          }
+          (r/'index-stats.json').write_text(json.dumps(stats,indent=2,sort_keys=True))
+          print(stats)
+          PY
+      - name: Warm E2E, cold-build cost, and diagnostics
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          cp "$RUNNER_TEMP/index-stats.json" "$RUNNER_TEMP/out/index-stats.json"
+          cp "$RUNNER_TEMP/oracle-stats.json" "$RUNNER_TEMP/out/oracle-stats.json"
+          export RUSTUP_TOOLCHAIN=1.95.0 CARGO_HOME="$RUNNER_TEMP/cargo-home" CARGO_NET_OFFLINE=true
+          export COMMAND_JSON='["metadata","--format-version","1","--locked","--offline"]'
+          export VARIANTS_JSON="$(python3 - <<'PY'
+          import json,os
+          r=os.environ['RUNNER_TEMP']
+          print(json.dumps({
+            'base': {'path':f'{r}/bin/cargo-base'},
+            'index': {'path':f'{r}/bin/cargo-index','env':{'CARGO_GIT_MANIFEST_INDEX_USE':'1'}},
+            'full': {'path':f'{r}/bin/cargo-full'},
+            'full-index': {'path':f'{r}/bin/cargo-full-index','env':{'CARGO_GIT_MANIFEST_INDEX_USE':'1'}},
+            'oracle': {'path':f'{r}/bin/cargo-oracle','env':{'CARGO_GIT_MANIFEST_ORACLE':'1'}},
+          }))
+          PY
+          )"
+          python3 .github/manifest-parsing-experiment/measure_variants.py \
+            "$RUNNER_TEMP/zed" "$RUNNER_TEMP/out/zed-realistic-${{ matrix.replica }}.json" 30
+
+          python3 - <<'PY'
+          import json, os, pathlib, statistics, subprocess, time
+          r=pathlib.Path(os.environ['RUNNER_TEMP']); home=pathlib.Path(os.environ['CARGO_HOME']); cwd=r/'zed'
+          base=r/'bin/cargo-base'; idx=r/'bin/cargo-index'
+          env=os.environ.copy()
+          rows=[]
+          order=['base','build']*6
+          for i,name in enumerate(order):
+              for p in (home/'git'/'checkouts').rglob('.cargo-manifest-index-experiment'):
+                  p.unlink()
+              e=env.copy()
+              binp=base
+              if name=='build':
+                  binp=idx; e['CARGO_GIT_MANIFEST_INDEX_BUILD']='1'
+              t=time.perf_counter_ns()
+              p=subprocess.run([str(binp),'metadata','--format-version','1','--locked','--offline'],cwd=cwd,env=e,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True)
+              ms=(time.perf_counter_ns()-t)/1e6
+              if p.returncode: raise SystemExit(p.stderr[-6000:])
+              rows.append({'iteration':i,'variant':name,'elapsed_ms':ms})
+          by={n:[x['elapsed_ms'] for x in rows if x['variant']==n] for n in ('base','build')}
+          out={'rows':rows,'median_ms':{n:statistics.median(v) for n,v in by.items()},'mean_ms':{n:statistics.mean(v) for n,v in by.items()}}
+          out['median_build_overhead_ms']=out['median_ms']['build']-out['median_ms']['base']
+          (r/'out'/f'cold-build-${{ matrix.replica }}.json').write_text(json.dumps(out,indent=2,sort_keys=True))
+          print(json.dumps(out,indent=2,sort_keys=True))
+          PY
+
+          # Rebuild the sidecars after the cold-cost loop deleted them.
+          cd "$RUNNER_TEMP/zed"
+          CARGO_GIT_MANIFEST_INDEX_BUILD=1 "$RUNNER_TEMP/bin/cargo-index" metadata --format-version 1 --locked --offline >/dev/null
+          CARGO_GIT_MANIFEST_INDEX_USE=1 CARGO_GIT_MANIFEST_INDEX_STATS=1 \
+            "$RUNNER_TEMP/bin/cargo-index" metadata --format-version 1 --locked --offline \
+            >/dev/null 2> "$RUNNER_TEMP/out/index-query-stats-${{ matrix.replica }}.txt"
+
+          if command -v strace >/dev/null; then
+            strace -f -c "$RUNNER_TEMP/bin/cargo-base" metadata --format-version 1 --locked --offline >/dev/null 2> "$RUNNER_TEMP/out/strace-base-${{ matrix.replica }}.txt" || true
+            CARGO_GIT_MANIFEST_INDEX_USE=1 strace -f -c "$RUNNER_TEMP/bin/cargo-index" metadata --format-version 1 --locked --offline >/dev/null 2> "$RUNNER_TEMP/out/strace-index-${{ matrix.replica }}.txt" || true
+            CARGO_GIT_MANIFEST_ORACLE=1 strace -f -c "$RUNNER_TEMP/bin/cargo-oracle" metadata --format-version 1 --locked --offline >/dev/null 2> "$RUNNER_TEMP/out/strace-oracle-${{ matrix.replica }}.txt" || true
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: realistic-zed-${{ matrix.replica }}
+          path: ${{ runner.temp }}/out
+          retention-days: 30
+
+  synthetic-realistic:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: experiment/14395-realistic-index-e2e
+          fetch-depth: 1
+      - uses: actions/download-artifact@v4
+        with:
+          name: realistic-index-variants
+          path: ${{ runner.temp }}
+      - name: Synthetic realistic-index scaling
+        shell: bash
+        run: |
+          set -euxo pipefail
+          tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/realistic-index-variants.tgz"
+          rustup toolchain install 1.95.0 --profile minimal
+          mkdir -p "$RUNNER_TEMP/out"
+          python3 .github/manifest-parsing-experiment/synthetic_realistic_index.py \
+            "$RUNNER_TEMP/synthetic" \
+            "$RUNNER_TEMP/bin/cargo-base" \
+            "$RUNNER_TEMP/bin/cargo-index" \
+            "$RUNNER_TEMP/bin/cargo-oracle" \
+            "$RUNNER_TEMP/out/synthetic-realistic.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: realistic-synthetic
+          path: ${{ runner.temp }}/out
+          retention-days: 30
