@@ -13,8 +13,10 @@ subprocess.run(
 path_rs = root / "src/sources/path.rs"
 s = path_rs.read_text()
 
-# Treat the sidecar as an optimization only: parse it strictly. A partial or
-# malformed index must never become a partial source of truth.
+# Treat the sidecar as a complete snapshot and an optimization only. A torn or
+# malformed index must never become a partial source of truth. The footer count
+# lets a valid snapshot answer a missing package name authoritatively without
+# falling back to a full recursive scan.
 old_loader = '''            if self.manifest_index.borrow().is_none() {
                 let index_path = self.path.join(".cargo-manifest-index-experiment");
                 if let Ok(contents) = fs::read_to_string(&index_path) {
@@ -40,37 +42,50 @@ old_loader = '''            if self.manifest_index.borrow().is_none() {
 new_loader = '''            if self.manifest_index.borrow().is_none() {
                 let index_path = self.path.join(".cargo-manifest-index-experiment");
                 if let Ok(contents) = fs::read_to_string(&index_path) {
-                    let mut lines = contents.lines();
-                    let mut valid = lines.next() == Some("cargo-manifest-index-v1");
+                    let lines = contents.lines().collect::<Vec<_>>();
+                    let mut valid = lines.first().copied() == Some("cargo-manifest-index-v2");
                     let mut index = HashMap::<String, Vec<PathBuf>>::default();
                     if valid {
-                        for line in lines {
-                            let Some((name, rel)) = line.split_once('\\t') else {
+                        if lines.len() < 2 {
+                            valid = false;
+                        } else {
+                            let body = &lines[1..lines.len() - 1];
+                            let expected_entries = lines[lines.len() - 1]
+                                .strip_prefix("cargo-manifest-index-end\\t")
+                                .and_then(|value| value.parse::<usize>().ok());
+                            if expected_entries != Some(body.len()) {
                                 valid = false;
-                                break;
-                            };
-                            if name.is_empty() || rel.is_empty() {
-                                valid = false;
-                                break;
                             }
-                            let rel = PathBuf::from(rel);
-                            if rel.is_absolute()
-                                || rel.components().any(|component| {
-                                    matches!(
-                                        component,
-                                        std::path::Component::ParentDir
-                                            | std::path::Component::RootDir
-                                            | std::path::Component::Prefix(_)
-                                    )
-                                })
-                            {
-                                valid = false;
-                                break;
+                            if valid {
+                                for line in body {
+                                    let Some((name, rel)) = line.split_once('\\t') else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    if name.is_empty() || rel.is_empty() {
+                                        valid = false;
+                                        break;
+                                    }
+                                    let rel = PathBuf::from(rel);
+                                    if rel.is_absolute()
+                                        || rel.components().any(|component| {
+                                            matches!(
+                                                component,
+                                                std::path::Component::ParentDir
+                                                    | std::path::Component::RootDir
+                                                    | std::path::Component::Prefix(_)
+                                            )
+                                        })
+                                    {
+                                        valid = false;
+                                        break;
+                                    }
+                                    index.entry(name.to_owned()).or_default().push(rel);
+                                }
                             }
-                            index.entry(name.to_owned()).or_default().push(rel);
                         }
                     }
-                    if valid && !index.is_empty() {
+                    if valid {
                         self.manifest_index.replace(Some(index));
                     }
                 }
@@ -78,6 +93,20 @@ new_loader = '''            if self.manifest_index.borrow().is_none() {
 '''
 assert old_loader in s, "warm index loader shape changed"
 s = s.replace(old_loader, new_loader, 1)
+
+# A validated complete snapshot can answer a negative lookup. This is crucial:
+# dependency resolution probes names that do not exist in a particular git
+# source. Treating every miss as cache corruption collapses back to eager load.
+old_lookup = '''            if let Some(candidates) = candidates {
+                let candidates = candidates.unwrap_or_default();
+'''
+new_lookup = '''            if let Some(candidates) = candidates {
+                let Some(candidates) = candidates else {
+                    return Ok(());
+                };
+'''
+assert old_lookup in s, "warm index lookup shape changed"
+s = s.replace(old_lookup, new_lookup, 1)
 
 # If an indexed name points at a missing path, or no longer materializes a
 # package with that name, abandon the index and fall back to the existing full
@@ -237,7 +266,7 @@ s = s.replace(old_candidates, new_candidates, 1)
 
 # Preserve duplicate PackageId ordering from the authoritative full discovery.
 # Sort package-id groups for deterministic output, but never sort paths inside a
-# duplicate group. Write through a per-process temporary file and rename.
+# duplicate group. Publish an explicitly complete snapshot via temp + rename.
 old_writer = '''            let mut lines = Vec::new();
             for (pkg_id, packages) in &all_packages {
                 for pkg in packages {
@@ -277,12 +306,14 @@ new_writer = '''            let mut groups = Vec::<(String, String, Vec<String>)
             }
             groups.sort_by(|a, b| a.0.cmp(&b.0));
 
-            let mut lines = vec!["cargo-manifest-index-v1".to_owned()];
+            let mut lines = vec!["cargo-manifest-index-v2".to_owned()];
             for (_, name, rels) in groups {
                 for rel in rels {
                     lines.push(format!("{}\\t{}", name, rel));
                 }
             }
+            let entry_count = lines.len() - 1;
+            lines.push(format!("cargo-manifest-index-end\\t{}", entry_count));
             let contents = lines.join("\\n") + "\\n";
             let index_path = path.join(".cargo-manifest-index-experiment");
             let temp_path = path.join(format!(
@@ -314,4 +345,4 @@ assert old_writer in s, "warm index writer shape changed"
 s = s.replace(old_writer, new_writer, 1)
 
 path_rs.write_text(s)
-print("hardened realistic warm git manifest index variant")
+print("hardened realistic warm git manifest index variant v2")
