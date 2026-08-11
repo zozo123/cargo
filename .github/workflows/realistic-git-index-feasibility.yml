@@ -41,6 +41,7 @@ jobs:
           build_variant() {
             name="$1"
             dir="$RUNNER_TEMP/cargo-$name"
+            target="$RUNNER_TEMP/target-$name"
             git -C "$RUNNER_TEMP/cargo-src" worktree add --detach "$dir" upstream-base
             case "$name" in
               base) ;;
@@ -54,9 +55,9 @@ jobs:
             esac
             git -C "$dir" diff --check
             git -C "$dir" diff > "$RUNNER_TEMP/results/$name.diff"
-            CARGO_TARGET_DIR="$RUNNER_TEMP/shared-target" \
+            CARGO_TARGET_DIR="$target" \
               cargo +1.97.0 build --release --locked --bin cargo --manifest-path "$dir/Cargo.toml"
-            cp "$RUNNER_TEMP/shared-target/release/cargo" "$RUNNER_TEMP/bin/cargo-$name"
+            cp "$target/release/cargo" "$RUNNER_TEMP/bin/cargo-$name"
             chmod +x "$RUNNER_TEMP/bin/cargo-$name"
             "$RUNNER_TEMP/bin/cargo-$name" --version --verbose > "$RUNNER_TEMP/results/$name-version.txt"
             sha256sum "$RUNNER_TEMP/bin/cargo-$name" >> "$RUNNER_TEMP/results/binaries.sha256"
@@ -173,6 +174,13 @@ jobs:
           find "$CARGO_HOME/git/checkouts" -name .cargo-manifest-index-experiment -delete 2>/dev/null || true
           CARGO_GIT_MANIFEST_INDEX_BUILD=1 \
             "$RUNNER_TEMP/bin/cargo-index" metadata --format-version 1 --locked --offline > "$RUNNER_TEMP/build-meta.json"
+
+          # Populate the explicit upper-bound oracle from the same frozen base
+          # metadata before any oracle timing. Without these sidecars the oracle
+          # binary correctly falls back and does not measure the intended ceiling.
+          python3 "$GITHUB_WORKSPACE/.github/manifest-parsing-experiment/write_oracle_from_metadata.py" \
+            "$RUNNER_TEMP/base-meta.json" "$RUNNER_TEMP/oracle-stats.json"
+
           CARGO_GIT_MANIFEST_INDEX_USE=1 \
             "$RUNNER_TEMP/bin/cargo-index" metadata --format-version 1 --locked --offline > "$RUNNER_TEMP/index-meta.json"
           CARGO_GIT_MANIFEST_ORACLE=1 \
@@ -189,8 +197,11 @@ jobs:
           entries=[]
           for p in idx:
               lines=p.read_text().splitlines()
-              assert lines and lines[0] == 'cargo-manifest-index-v1', p
-              entries.extend(line for line in lines[1:] if '\t' in line)
+              assert lines and lines[0] == 'cargo-manifest-index-v2', p
+              assert len(lines) >= 2 and lines[-1].startswith('cargo-manifest-index-end\t'), p
+              body=lines[1:-1]
+              assert int(lines[-1].split('\t',1)[1]) == len(body), p
+              entries.extend(line for line in body if '\t' in line)
           stats={
               'index_files':len(idx),
               'index_entries':len(entries),
@@ -206,6 +217,7 @@ jobs:
           set -euxo pipefail
           mkdir -p "$RUNNER_TEMP/out"
           cp "$RUNNER_TEMP/index-stats.json" "$RUNNER_TEMP/out/index-stats.json"
+          cp "$RUNNER_TEMP/oracle-stats.json" "$RUNNER_TEMP/out/oracle-stats.json"
           export RUSTUP_TOOLCHAIN=1.95.0 CARGO_HOME="$RUNNER_TEMP/cargo-home" CARGO_NET_OFFLINE=true
           export COMMAND_JSON='["metadata","--format-version","1","--locked","--offline"]'
           export VARIANTS_JSON="$(python3 - <<'PY'
@@ -261,7 +273,6 @@ jobs:
           print(json.dumps(out,indent=2,sort_keys=True))
           PY
 
-          # Query work and syscall shape for the hardened warm path.
           cd "$RUNNER_TEMP/zed"
           CARGO_GIT_MANIFEST_INDEX_BUILD=1 "$RUNNER_TEMP/bin/cargo-index" metadata --format-version 1 --locked --offline >/dev/null
           CARGO_GIT_MANIFEST_INDEX_USE=1 CARGO_GIT_MANIFEST_INDEX_STATS=1 \
