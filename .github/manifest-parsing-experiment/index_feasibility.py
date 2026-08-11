@@ -66,7 +66,6 @@ def write_package(path, name, version="0.1.0", extra=""):
 
 
 def file_url(path):
-    # Git accepts file:// URLs. quote keeps spaces deterministic.
     return "file://" + quote(str(path))
 
 
@@ -94,7 +93,6 @@ def bootstrap(consumer, home):
     home.mkdir(parents=True, exist_ok=True)
     e = os.environ.copy()
     e["CARGO_HOME"] = str(home)
-    # First run creates Cargo.lock and fetches the local git source.
     run([cargo_base, "metadata", "--format-version", "1"], consumer, e)
 
 
@@ -155,6 +153,9 @@ assert base_git == idx_git
 record("duplicate-package-id", selected=base_git)
 
 # 2. Hidden/sub-repository packages reachable only through path dependencies.
+# Cargo does not resolve a dev-dependency of a non-root git dependency into the
+# metadata graph, but full discovery must still see it and preserve it in the
+# complete index. The warm result itself must be byte-for-byte equivalent.
 case = root / "path-deps"
 source = case / "source"
 consumer = case / "consumer"
@@ -184,12 +185,22 @@ metadata(cargo_index, consumer, home, CARGO_GIT_MANIFEST_INDEX_BUILD="1")
 idx_doc, _ = metadata(cargo_index, consumer, home, CARGO_GIT_MANIFEST_INDEX_USE="1")
 assert_equal("path-dependency closure", base_doc, idx_doc)
 names = sorted(p["name"] for p in base_doc["packages"])
-for expected in ("foo", "normal-hidden", "build-hidden", "dev-hidden", "target-hidden", "subrepo-dep"):
+for expected in ("foo", "normal-hidden", "build-hidden", "target-hidden", "subrepo-dep"):
     assert expected in names, (expected, names)
-record("hidden-and-path-dependency-closure", packages=names)
+path_indices = sidecars(home)
+assert len(path_indices) == 1, path_indices
+path_index_text = path_indices[0].read_text()
+assert "\ndev-hidden\t" in "\n" + path_index_text, path_index_text
+record(
+    "hidden-and-path-dependency-closure",
+    packages=names,
+    dev_dependency_discovered_in_index=True,
+)
 
-# 3. Cache failure modes. Any malformed, partial, unsafe, or stale-looking
-# sidecar must behave exactly like no cache.
+# 3. Cache failure modes. Missing, malformed, unsafe, torn, or stale candidate
+# data must behave exactly like no cache. A complete valid snapshot may answer a
+# missing package name authoritatively; the partial fixture therefore keeps a
+# mismatched footer count so it is recognizably incomplete.
 case = root / "fallback"
 source = case / "source"
 consumer = case / "consumer"
@@ -206,15 +217,15 @@ paths = sidecars(home)
 assert len(paths) == 1, paths
 index_path = paths[0]
 valid = index_path.read_text()
-assert valid.startswith("cargo-manifest-index-v1\n")
+assert valid.startswith("cargo-manifest-index-v2\n")
 mutations = {
     "missing": None,
-    "bad-header": "not-our-format\nfoo\tfoo-dir\n",
-    "truncated": "cargo-manifest-index-v1\nbroken-line\n",
-    "unsafe-parent": "cargo-manifest-index-v1\nfoo\t../../escape\n",
-    "wrong-path": "cargo-manifest-index-v1\nfoo\tmissing\n",
-    "wrong-name": "cargo-manifest-index-v1\nfoo\tbar-dir\n",
-    "partial-no-key": "cargo-manifest-index-v1\nbar\tbar-dir\n",
+    "bad-header": "not-our-format\nfoo\tfoo-dir\ncargo-manifest-index-end\t1\n",
+    "truncated": "cargo-manifest-index-v2\nfoo\tfoo-dir\n",
+    "unsafe-parent": "cargo-manifest-index-v2\nfoo\t../../escape\ncargo-manifest-index-end\t1\n",
+    "wrong-path": "cargo-manifest-index-v2\nfoo\tmissing\ncargo-manifest-index-end\t1\n",
+    "wrong-name": "cargo-manifest-index-v2\nfoo\tbar-dir\ncargo-manifest-index-end\t1\n",
+    "partial-no-key": "cargo-manifest-index-v2\nbar\tbar-dir\ncargo-manifest-index-end\t2\n",
 }
 for label, contents in mutations.items():
     if index_path.exists():
@@ -226,8 +237,8 @@ for label, contents in mutations.items():
 index_path.write_text(valid)
 record("missing-corrupt-stale-fallback", variants=sorted(mutations))
 
-# 4. Concurrent cold builders. Cargo may serialize some work internally; this
-# still verifies that multiple real processes cannot publish a torn sidecar.
+# 4. Concurrent cold builders. Multiple real processes must never publish a
+# torn snapshot or leave temporary files behind.
 case = root / "concurrent"
 source = case / "source"
 consumer = case / "consumer"
@@ -263,7 +274,8 @@ assert not errs, errs
 paths = sidecars(home)
 assert len(paths) == 1, paths
 text = paths[0].read_text()
-assert text.startswith("cargo-manifest-index-v1\n")
+assert text.startswith("cargo-manifest-index-v2\n")
+assert "\ncargo-manifest-index-end\t" in text
 assert not list(paths[0].parent.glob(".cargo-manifest-index-experiment.tmp-*"))
 doc, _ = metadata(cargo_index, consumer, home, CARGO_GIT_MANIFEST_INDEX_USE="1")
 assert_equal("concurrent builders warm", base_doc, doc)
@@ -289,7 +301,6 @@ rev_b = commit(source, "revision b")
 make_consumer(consumer, source, rev_b)
 bootstrap(consumer, home)
 base_b, _ = metadata(cargo_base, consumer, home)
-# No build for B: warm-index mode must fall back to current discovery.
 idx_b, _ = metadata(cargo_index, consumer, home, CARGO_GIT_MANIFEST_INDEX_USE="1")
 assert_equal("revision fallback", base_b, idx_b)
 assert base_a != base_b, "revision fixture did not change metadata"
