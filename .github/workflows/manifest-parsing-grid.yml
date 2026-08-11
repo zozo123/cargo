@@ -1,0 +1,316 @@
+name: Manifest parsing experiment grid
+
+on:
+  push:
+    branches:
+      - experiment/14395-grid-e2e
+    paths:
+      - .github/workflows/manifest-parsing-grid.yml
+      - .github/manifest-parsing-experiment/**
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_SHA: 9184583d2dc29ac1e23c6304f7281fd3941bb1bb
+  ZED_SHA: 5e03f2d387e629237c10a4e4fed881b64abd8fea
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    if: github.repository == 'zozo123/cargo'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: experiment/14395-grid-e2e
+          fetch-depth: 1
+
+      - name: Install Cargo build toolchain
+        run: rustup toolchain install 1.97.0 --profile minimal
+
+      - name: Build frozen experiment variants
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/bin" "$RUNNER_TEMP/results"
+          git init "$RUNNER_TEMP/cargo-src"
+          git -C "$RUNNER_TEMP/cargo-src" remote add upstream https://github.com/rust-lang/cargo.git
+          git -C "$RUNNER_TEMP/cargo-src" fetch --depth 1 upstream "$UPSTREAM_SHA"
+          git -C "$RUNNER_TEMP/cargo-src" branch upstream-base FETCH_HEAD
+
+          build_variant() {
+            name="$1"
+            mode="$2"
+            dir="$RUNNER_TEMP/cargo-$name"
+            git -C "$RUNNER_TEMP/cargo-src" worktree add --detach "$dir" upstream-base
+            if [ "$mode" = cache-json ]; then
+              git -C "$dir" apply "$GITHUB_WORKSPACE/.github/manifest-parsing-experiment/cache-prototype.patch"
+            elif [ "$mode" != base ]; then
+              python3 "$GITHUB_WORKSPACE/.github/manifest-parsing-experiment/make_parser_variant.py" "$dir" "$mode"
+            fi
+            git -C "$dir" diff --check
+            git -C "$dir" diff > "$RUNNER_TEMP/results/$name.diff"
+            CARGO_TARGET_DIR="$RUNNER_TEMP/shared-target" \
+              cargo +1.97.0 build --release --locked --bin cargo --manifest-path "$dir/Cargo.toml"
+            cp "$RUNNER_TEMP/shared-target/release/cargo" "$RUNNER_TEMP/bin/cargo-$name"
+            chmod +x "$RUNNER_TEMP/bin/cargo-$name"
+            "$RUNNER_TEMP/bin/cargo-$name" --version --verbose > "$RUNNER_TEMP/results/$name-version.txt"
+            sha256sum "$RUNNER_TEMP/bin/cargo-$name" >> "$RUNNER_TEMP/results/binaries.sha256"
+            git -C "$RUNNER_TEMP/cargo-src" worktree remove --force "$dir"
+          }
+
+          build_variant base base
+          build_variant full full
+          build_variant git-only git-only
+          build_variant registry-only registry-only
+          build_variant spanned-no-retain spanned-no-retain
+          build_variant hash-only hash-only
+          build_variant hash-read-direct hash-read-direct
+          build_variant cache-json cache-json
+
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/variants.tgz" bin results
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: manifest-grid-variants
+          path: ${{ runner.temp }}/variants.tgz
+          retention-days: 30
+
+  source-kind:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        replica: [1, 2, 3]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: experiment/14395-grid-e2e
+          fetch-depth: 1
+      - uses: actions/download-artifact@v4
+        with:
+          name: manifest-grid-variants
+          path: ${{ runner.temp }}
+      - name: Unpack and install runtime toolchain
+        run: |
+          tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/variants.tgz"
+          rustup toolchain install 1.95.0 --profile minimal
+      - name: Prepare pinned Zed
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git init "$RUNNER_TEMP/zed"
+          git -C "$RUNNER_TEMP/zed" remote add origin https://github.com/zed-industries/zed.git
+          git -C "$RUNNER_TEMP/zed" fetch --depth 1 origin "$ZED_SHA"
+          git -C "$RUNNER_TEMP/zed" checkout --detach FETCH_HEAD
+          export RUSTUP_TOOLCHAIN=1.95.0
+          export CARGO_HOME="$RUNNER_TEMP/cargo-home"
+          "$RUNNER_TEMP/bin/cargo-base" fetch --locked
+          for v in base full git-only registry-only; do
+            "$RUNNER_TEMP/bin/cargo-$v" metadata --format-version 1 --locked --offline > "$RUNNER_TEMP/meta-$v.json"
+          done
+          python3 - <<'PY'
+          import json, os
+          r=os.environ['RUNNER_TEMP']
+          names=['base','full','git-only','registry-only']
+          docs={n:json.load(open(f'{r}/meta-{n}.json')) for n in names}
+          for n in names[1:]:
+              assert docs[n] == docs['base'], n
+          print('metadata equivalent:', ', '.join(names))
+          PY
+      - name: Experiment 1 - source-kind attribution
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          export RUSTUP_TOOLCHAIN=1.95.0
+          export CARGO_HOME="$RUNNER_TEMP/cargo-home"
+          export CARGO_NET_OFFLINE=true
+          export COMMAND_JSON='["metadata","--format-version","1","--locked","--offline"]'
+          export VARIANTS_JSON="$(python3 - <<'PY'
+          import json, os
+          r=os.environ['RUNNER_TEMP']
+          print(json.dumps({n:{'path':f'{r}/bin/cargo-{n}'} for n in ['base','full','git-only','registry-only']}))
+          PY
+          )"
+          python3 .github/manifest-parsing-experiment/measure_variants.py \
+            "$RUNNER_TEMP/zed" "$RUNNER_TEMP/out/source-kind-${{ matrix.replica }}.json" 24
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source-kind-${{ matrix.replica }}
+          path: ${{ runner.temp }}/out
+          retention-days: 30
+
+  parser-work:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: experiment/14395-grid-e2e
+          fetch-depth: 1
+      - uses: actions/download-artifact@v4
+        with:
+          name: manifest-grid-variants
+          path: ${{ runner.temp }}
+      - name: Prepare Zed and binaries
+        shell: bash
+        run: |
+          set -euxo pipefail
+          tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/variants.tgz"
+          rustup toolchain install 1.95.0 --profile minimal
+          git init "$RUNNER_TEMP/zed"
+          git -C "$RUNNER_TEMP/zed" remote add origin https://github.com/zed-industries/zed.git
+          git -C "$RUNNER_TEMP/zed" fetch --depth 1 origin "$ZED_SHA"
+          git -C "$RUNNER_TEMP/zed" checkout --detach FETCH_HEAD
+          export RUSTUP_TOOLCHAIN=1.95.0 CARGO_HOME="$RUNNER_TEMP/cargo-home"
+          "$RUNNER_TEMP/bin/cargo-base" fetch --locked
+          for v in base spanned-no-retain full; do
+            "$RUNNER_TEMP/bin/cargo-$v" metadata --format-version 1 --locked --offline > "$RUNNER_TEMP/meta-$v.json"
+          done
+          python3 - <<'PY'
+          import json,os
+          r=os.environ['RUNNER_TEMP']; ns=['base','spanned-no-retain','full']
+          d={n:json.load(open(f'{r}/meta-{n}.json')) for n in ns}
+          assert all(d[n]==d['base'] for n in ns)
+          PY
+      - name: Experiment 2 - parser work decomposition
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          export RUSTUP_TOOLCHAIN=1.95.0 CARGO_HOME="$RUNNER_TEMP/cargo-home" CARGO_NET_OFFLINE=true
+          export COMMAND_JSON='["metadata","--format-version","1","--locked","--offline"]'
+          export VARIANTS_JSON="$(python3 - <<'PY'
+          import json,os
+          r=os.environ['RUNNER_TEMP']; ns=['base','spanned-no-retain','full']
+          print(json.dumps({n:{'path':f'{r}/bin/cargo-{n}'} for n in ns}))
+          PY
+          )"
+          python3 .github/manifest-parsing-experiment/measure_variants.py \
+            "$RUNNER_TEMP/zed" "$RUNNER_TEMP/out/parser-work.json" 24
+
+          cd "$RUNNER_TEMP/zed"
+          for v in base spanned-no-retain full; do
+            : > "$RUNNER_TEMP/out/rss-$v.txt"
+            for i in 1 2 3 4 5; do
+              /usr/bin/time -v "$RUNNER_TEMP/bin/cargo-$v" metadata --format-version 1 --locked --offline >/dev/null \
+                2> "$RUNNER_TEMP/rss.tmp"
+              grep 'Maximum resident set size' "$RUNNER_TEMP/rss.tmp" >> "$RUNNER_TEMP/out/rss-$v.txt"
+            done
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: parser-work
+          path: ${{ runner.temp }}/out
+          retention-days: 30
+
+  cache-ablation:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: experiment/14395-grid-e2e
+          fetch-depth: 1
+      - uses: actions/download-artifact@v4
+        with:
+          name: manifest-grid-variants
+          path: ${{ runner.temp }}
+      - name: Prepare Zed and cache
+        shell: bash
+        run: |
+          set -euxo pipefail
+          tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/variants.tgz"
+          rustup toolchain install 1.95.0 --profile minimal
+          git init "$RUNNER_TEMP/zed"
+          git -C "$RUNNER_TEMP/zed" remote add origin https://github.com/zed-industries/zed.git
+          git -C "$RUNNER_TEMP/zed" fetch --depth 1 origin "$ZED_SHA"
+          git -C "$RUNNER_TEMP/zed" checkout --detach FETCH_HEAD
+          export RUSTUP_TOOLCHAIN=1.95.0 CARGO_HOME="$RUNNER_TEMP/cargo-home"
+          "$RUNNER_TEMP/bin/cargo-base" fetch --locked
+          rm -rf "$CARGO_HOME/manifest-cache-experiment"
+          CARGO_MANIFEST_CACHE_EXPERIMENT=1 "$RUNNER_TEMP/bin/cargo-cache-json" metadata --format-version 1 --locked --offline >/dev/null
+          for v in full hash-only hash-read-direct; do
+            "$RUNNER_TEMP/bin/cargo-$v" metadata --format-version 1 --locked --offline > "$RUNNER_TEMP/meta-$v.json"
+          done
+          CARGO_MANIFEST_CACHE_EXPERIMENT=1 "$RUNNER_TEMP/bin/cargo-cache-json" metadata --format-version 1 --locked --offline > "$RUNNER_TEMP/meta-cache-json.json"
+          python3 - <<'PY'
+          import json,os
+          r=os.environ['RUNNER_TEMP']; ns=['full','hash-only','hash-read-direct','cache-json']
+          d={n:json.load(open(f'{r}/meta-{n}.json')) for n in ns}
+          assert all(d[n]==d['full'] for n in ns)
+          PY
+      - name: Experiment 3 - cache overhead ablation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          export RUSTUP_TOOLCHAIN=1.95.0 CARGO_HOME="$RUNNER_TEMP/cargo-home" CARGO_NET_OFFLINE=true
+          export COMMAND_JSON='["metadata","--format-version","1","--locked","--offline"]'
+          export VARIANTS_JSON="$(python3 - <<'PY'
+          import json,os
+          r=os.environ['RUNNER_TEMP']
+          print(json.dumps({
+            'full': {'path':f'{r}/bin/cargo-full'},
+            'hash-only': {'path':f'{r}/bin/cargo-hash-only'},
+            'hash-read-direct': {'path':f'{r}/bin/cargo-hash-read-direct'},
+            'cache-json': {'path':f'{r}/bin/cargo-cache-json','env':{'CARGO_MANIFEST_CACHE_EXPERIMENT':'1'}},
+          }))
+          PY
+          )"
+          python3 .github/manifest-parsing-experiment/measure_variants.py \
+            "$RUNNER_TEMP/zed" "$RUNNER_TEMP/out/cache-ablation.json" 20
+
+          find "$CARGO_HOME/manifest-cache-experiment" -type f -printf '%s\n' 2>/dev/null \
+            | awk '{n++;b+=$1} END {print "entries=" n; print "bytes=" b}' > "$RUNNER_TEMP/out/cache-footprint.txt"
+          if command -v strace >/dev/null; then
+            cd "$RUNNER_TEMP/zed"
+            strace -f -c "$RUNNER_TEMP/bin/cargo-full" metadata --format-version 1 --locked --offline >/dev/null \
+              2> "$RUNNER_TEMP/out/strace-full.txt" || true
+            CARGO_MANIFEST_CACHE_EXPERIMENT=1 strace -f -c "$RUNNER_TEMP/bin/cargo-cache-json" metadata --format-version 1 --locked --offline >/dev/null \
+              2> "$RUNNER_TEMP/out/strace-cache-json.txt" || true
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cache-ablation
+          path: ${{ runner.temp }}/out
+          retention-days: 30
+
+  synthetic-scaling:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: experiment/14395-grid-e2e
+          fetch-depth: 1
+      - uses: actions/download-artifact@v4
+        with:
+          name: manifest-grid-variants
+          path: ${{ runner.temp }}
+      - name: Experiment 4 - git source N/U scaling and pruned upper bound
+        shell: bash
+        run: |
+          set -euxo pipefail
+          tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/variants.tgz"
+          rustup toolchain install 1.95.0 --profile minimal
+          mkdir -p "$RUNNER_TEMP/out"
+          python3 .github/manifest-parsing-experiment/synthetic_git_scaling.py \
+            "$RUNNER_TEMP/synthetic" \
+            "$RUNNER_TEMP/bin/cargo-base" \
+            "$RUNNER_TEMP/bin/cargo-full" \
+            "$RUNNER_TEMP/out/synthetic-scaling.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: synthetic-scaling
+          path: ${{ runner.temp }}/out
+          retention-days: 30
