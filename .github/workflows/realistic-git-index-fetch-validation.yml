@@ -1,0 +1,320 @@
+name: Git manifest index fetch validation
+
+on:
+  push:
+    branches:
+      - experiment/14395-index-feasibility-e2e
+    paths:
+      - .github/workflows/realistic-git-index-fetch-validation.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  ZED_SHA: 5e03f2d387e629237c10a4e4fed881b64abd8fea
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: 1
+  VARIANT_RUN_ID: 31575321954
+
+jobs:
+  zed-fetch:
+    strategy:
+      fail-fast: false
+      matrix:
+        replica: [1, 2, 3]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: experiment/14395-index-feasibility-e2e
+          fetch-depth: 1
+      - uses: actions/download-artifact@v4
+        with:
+          name: index-feasibility-variants
+          path: ${{ runner.temp }}
+          github-token: ${{ github.token }}
+          run-id: ${{ env.VARIANT_RUN_ID }}
+      - name: Prepare pinned Zed and complete path index
+        shell: bash
+        run: |
+          set -euxo pipefail
+          tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/index-feasibility-variants.tgz"
+          rustup toolchain install 1.95.0 --profile minimal
+          git init "$RUNNER_TEMP/zed"
+          git -C "$RUNNER_TEMP/zed" remote add origin https://github.com/zed-industries/zed.git
+          git -C "$RUNNER_TEMP/zed" fetch --depth 1 origin "$ZED_SHA"
+          git -C "$RUNNER_TEMP/zed" checkout --detach FETCH_HEAD
+          export RUSTUP_TOOLCHAIN=1.95.0 CARGO_HOME="$RUNNER_TEMP/cargo-home"
+          cd "$RUNNER_TEMP/zed"
+          "$RUNNER_TEMP/bin/cargo-base" fetch --locked
+          "$RUNNER_TEMP/bin/cargo-base" fetch --locked --offline
+          find "$CARGO_HOME/git/checkouts" -name .cargo-manifest-index-experiment -delete 2>/dev/null || true
+          CARGO_GIT_MANIFEST_INDEX_BUILD=1 "$RUNNER_TEMP/bin/cargo-index" fetch --locked --offline
+
+          python3 - <<'PY'
+          import json, os, pathlib
+          home = pathlib.Path(os.environ['CARGO_HOME'])
+          idx = list((home/'git'/'checkouts').rglob('.cargo-manifest-index-experiment'))
+          assert idx, 'no index files were built'
+          entries = []
+          for p in idx:
+              lines = p.read_text().splitlines()
+              assert lines[0] == 'cargo-manifest-index-v2', p
+              assert lines[-1].startswith('cargo-manifest-index-end\t'), p
+              body = lines[1:-1]
+              assert int(lines[-1].split('\t', 1)[1]) == len(body), p
+              entries.extend(body)
+          stats = {'index_files': len(idx), 'index_entries': len(entries), 'index_bytes': sum(p.stat().st_size for p in idx)}
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'index-stats.json').write_text(json.dumps(stats, indent=2, sort_keys=True))
+          print(stats)
+          PY
+      - name: Measure cargo fetch with everything downloaded
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          cp "$RUNNER_TEMP/index-stats.json" "$RUNNER_TEMP/out/index-stats.json"
+          export RUSTUP_TOOLCHAIN=1.95.0 CARGO_HOME="$RUNNER_TEMP/cargo-home" CARGO_NET_OFFLINE=true
+          export COMMAND_JSON='["fetch","--locked","--offline"]'
+          export VARIANTS_JSON="$(python3 - <<'PY'
+          import json, os
+          r = os.environ['RUNNER_TEMP']
+          print(json.dumps({
+              'base': {'path': f'{r}/bin/cargo-base'},
+              'index': {'path': f'{r}/bin/cargo-index', 'env': {'CARGO_GIT_MANIFEST_INDEX_USE': '1'}},
+          }))
+          PY
+          )"
+          python3 .github/manifest-parsing-experiment/measure_variants.py \
+            "$RUNNER_TEMP/zed" "$RUNNER_TEMP/out/fetch-${{ matrix.replica }}.json" 50
+
+          cd "$RUNNER_TEMP/zed"
+          CARGO_GIT_MANIFEST_INDEX_USE=1 CARGO_GIT_MANIFEST_INDEX_STATS=1 \
+            "$RUNNER_TEMP/bin/cargo-index" fetch --locked --offline \
+            >/dev/null 2> "$RUNNER_TEMP/out/query-stats-${{ matrix.replica }}.txt"
+          if command -v strace >/dev/null; then
+            strace -f -c "$RUNNER_TEMP/bin/cargo-base" fetch --locked --offline >/dev/null 2> "$RUNNER_TEMP/out/strace-base-${{ matrix.replica }}.txt" || true
+            CARGO_GIT_MANIFEST_INDEX_USE=1 strace -f -c "$RUNNER_TEMP/bin/cargo-index" fetch --locked --offline >/dev/null 2> "$RUNNER_TEMP/out/strace-index-${{ matrix.replica }}.txt" || true
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fetch-validation-zed-${{ matrix.replica }}
+          path: ${{ runner.temp }}/out
+          retention-days: 30
+
+  warning-parity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: experiment/14395-index-feasibility-e2e
+          fetch-depth: 1
+      - uses: actions/download-artifact@v4
+        with:
+          name: index-feasibility-variants
+          path: ${{ runner.temp }}
+          github-token: ${{ github.token }}
+          run-id: ${{ env.VARIANT_RUN_ID }}
+      - name: Compare observable warnings with path-only cache
+        shell: bash
+        run: |
+          set -euxo pipefail
+          tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/index-feasibility-variants.tgz"
+          rustup toolchain install 1.95.0 --profile minimal
+          export RUSTUP_TOOLCHAIN=1.95.0 CARGO_HOME="$RUNNER_TEMP/cargo-home"
+          repo="$RUNNER_TEMP/warn-repo"
+          app="$RUNNER_TEMP/warn-app"
+          mkdir -p "$repo" "$app/src"
+          git init "$repo"
+          git -C "$repo" config user.email cargo-index@example.invalid
+          git -C "$repo" config user.name cargo-index-test
+
+          make_pkg() {
+            dir="$1"; name="$2"; extra="$3"
+            mkdir -p "$repo/$dir/src"
+            cat > "$repo/$dir/Cargo.toml" <<EOF2
+          [package]
+          name = "$name"
+          version = "0.1.0"
+          edition = "2021"
+          unexpected_key = true
+          $extra
+          EOF2
+            echo 'pub fn f() {}' > "$repo/$dir/src/lib.rs"
+          }
+
+          make_pkg used used $'[dependencies.hidden]\npath = "../.hidden"'
+          make_pkg .hidden hidden ''
+          make_pkg unused unused ''
+          make_pkg dup-a dupe ''
+          make_pkg dup-b dupe ''
+          git -C "$repo" add .
+          git -C "$repo" commit -m fixture
+
+          url="file://$repo"
+          cat > "$app/Cargo.toml" <<EOF2
+          [package]
+          name = "warn-app"
+          version = "0.1.0"
+          edition = "2021"
+
+          [dependencies]
+          used = { git = "$url" }
+          dupe = { git = "$url" }
+          EOF2
+          echo 'fn main() {}' > "$app/src/main.rs"
+
+          cd "$app"
+          "$RUNNER_TEMP/bin/cargo-base" fetch
+          find "$CARGO_HOME/git/checkouts" -name .cargo-manifest-index-experiment -delete 2>/dev/null || true
+          CARGO_GIT_MANIFEST_INDEX_BUILD=1 "$RUNNER_TEMP/bin/cargo-index" fetch --locked --offline >/dev/null 2>/dev/null
+
+          "$RUNNER_TEMP/bin/cargo-base" fetch --locked --offline > "$RUNNER_TEMP/base-fetch.out" 2> "$RUNNER_TEMP/base-fetch.err"
+          CARGO_GIT_MANIFEST_INDEX_USE=1 "$RUNNER_TEMP/bin/cargo-index" fetch --locked --offline > "$RUNNER_TEMP/index-fetch.out" 2> "$RUNNER_TEMP/index-fetch.err"
+          diff -u "$RUNNER_TEMP/base-fetch.out" "$RUNNER_TEMP/index-fetch.out"
+          diff -u "$RUNNER_TEMP/base-fetch.err" "$RUNNER_TEMP/index-fetch.err"
+
+          CARGO_TARGET_DIR="$RUNNER_TEMP/target-base" "$RUNNER_TEMP/bin/cargo-base" check --locked --offline > "$RUNNER_TEMP/base-check.out" 2> "$RUNNER_TEMP/base-check.err"
+          CARGO_GIT_MANIFEST_INDEX_USE=1 CARGO_TARGET_DIR="$RUNNER_TEMP/target-index" "$RUNNER_TEMP/bin/cargo-index" check --locked --offline > "$RUNNER_TEMP/index-check.out" 2> "$RUNNER_TEMP/index-check.err"
+          grep -E 'unused manifest key|skipping duplicate package|in favor of' "$RUNNER_TEMP/base-check.err" > "$RUNNER_TEMP/base-warnings.txt" || true
+          grep -E 'unused manifest key|skipping duplicate package|in favor of' "$RUNNER_TEMP/index-check.err" > "$RUNNER_TEMP/index-warnings.txt" || true
+          diff -u "$RUNNER_TEMP/base-warnings.txt" "$RUNNER_TEMP/index-warnings.txt"
+
+          mkdir -p "$RUNNER_TEMP/out"
+          cp "$RUNNER_TEMP"/*-warnings.txt "$RUNNER_TEMP/out/" || true
+          cp "$RUNNER_TEMP"/*-fetch.err "$RUNNER_TEMP/out/" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fetch-validation-warnings
+          path: ${{ runner.temp }}/out
+          retention-days: 30
+
+  singleton-sources:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: experiment/14395-index-feasibility-e2e
+          fetch-depth: 1
+      - uses: actions/download-artifact@v4
+        with:
+          name: index-feasibility-variants
+          path: ${{ runner.temp }}
+          github-token: ${{ github.token }}
+          run-id: ${{ env.VARIANT_RUN_ID }}
+      - name: Measure 50 one-manifest git sources
+        shell: bash
+        run: |
+          set -euxo pipefail
+          tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/index-feasibility-variants.tgz"
+          rustup toolchain install 1.95.0 --profile minimal
+          export RUSTUP_TOOLCHAIN=1.95.0 CARGO_HOME="$RUNNER_TEMP/cargo-home"
+          app="$RUNNER_TEMP/singleton-app"
+          mkdir -p "$app/src"
+          cat > "$app/Cargo.toml" <<'EOF2'
+          [package]
+          name = "singleton-app"
+          version = "0.1.0"
+          edition = "2021"
+
+          [dependencies]
+          EOF2
+          echo 'fn main() {}' > "$app/src/main.rs"
+
+          for i in $(seq -w 0 49); do
+            repo="$RUNNER_TEMP/single-$i"
+            mkdir -p "$repo/src"
+            git init "$repo"
+            git -C "$repo" config user.email cargo-index@example.invalid
+            git -C "$repo" config user.name cargo-index-test
+            cat > "$repo/Cargo.toml" <<EOF2
+          [package]
+          name = "p$i"
+          version = "0.1.0"
+          edition = "2021"
+          EOF2
+            echo 'pub fn f() {}' > "$repo/src/lib.rs"
+            git -C "$repo" add .
+            git -C "$repo" commit -m fixture
+            printf 'p%s = { git = "file://%s" }\n' "$i" "$repo" >> "$app/Cargo.toml"
+          done
+
+          cd "$app"
+          "$RUNNER_TEMP/bin/cargo-base" fetch
+          find "$CARGO_HOME/git/checkouts" -name .cargo-manifest-index-experiment -delete 2>/dev/null || true
+          CARGO_GIT_MANIFEST_INDEX_BUILD=1 "$RUNNER_TEMP/bin/cargo-index" fetch --locked --offline
+
+          mkdir -p "$RUNNER_TEMP/out"
+          export CARGO_NET_OFFLINE=true
+          export COMMAND_JSON='["fetch","--locked","--offline"]'
+          export VARIANTS_JSON="$(python3 - <<'PY'
+          import json, os
+          r = os.environ['RUNNER_TEMP']
+          print(json.dumps({
+              'base': {'path': f'{r}/bin/cargo-base'},
+              'index': {'path': f'{r}/bin/cargo-index', 'env': {'CARGO_GIT_MANIFEST_INDEX_USE': '1'}},
+          }))
+          PY
+          )"
+          python3 "$GITHUB_WORKSPACE/.github/manifest-parsing-experiment/measure_variants.py" \
+            "$app" "$RUNNER_TEMP/out/singleton-50.json" 50
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fetch-validation-singletons
+          path: ${{ runner.temp }}/out
+          retention-days: 30
+
+  aggregate:
+    if: always()
+    needs: [zed-fetch, warning-parity, singleton-sources]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: fetch-validation-*
+          path: ${{ runner.temp }}/all
+          merge-multiple: true
+      - name: Build decision summary
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, statistics
+          root = pathlib.Path('${{ runner.temp }}/all')
+          lines = ['# cargo#14395 fetch validation', '']
+          fetch = []
+          for p in sorted(root.glob('fetch-*.json')):
+              d = json.load(open(p)); c = d['comparisons_vs_first']['index']; base = d['variants']['base']['median_ms']
+              fetch.append((p.name, base, c['paired_mean_baseline_minus_variant_ms'], c['paired_mean_95ci_ms'], c['wins_variant_faster']))
+          lines.append('## pinned Zed: cargo fetch --locked --offline')
+          for name, base, mean, ci, wins in fetch:
+              lines.append(f'- {name}: base median {base:.2f} ms; index saves {mean:.2f} ms, 95% CI [{ci[0]:.2f}, {ci[1]:.2f}], wins {wins}/50, {100*mean/base:.1f}% of baseline median')
+          if fetch:
+              lines.append(f'- simple mean saving across replicas: {statistics.mean(x[2] for x in fetch):.2f} ms')
+          sp = root/'singleton-50.json'
+          if sp.exists():
+              d = json.load(open(sp)); c = d['comparisons_vs_first']['index']; base = d['variants']['base']['median_ms']
+              lines += ['', '## 50 one-manifest git sources', f"- base median {base:.2f} ms; index delta {c['paired_mean_baseline_minus_variant_ms']:.2f} ms (positive means faster), 95% CI [{c['paired_mean_95ci_ms'][0]:.2f}, {c['paired_mean_95ci_ms'][1]:.2f}], wins {c['wins_variant_faster']}/50"]
+          bw = root/'base-warnings.txt'; iw = root/'index-warnings.txt'
+          lines += ['', '## warning parity']
+          if bw.exists() and iw.exists():
+              lines.append(f'- filtered cargo-check warnings identical: {bw.read_text() == iw.read_text()}')
+              lines.append(f'- warning lines: {len(bw.read_text().splitlines())}')
+          else:
+              lines.append('- warning artifacts missing')
+          out = '\n'.join(lines) + '\n'
+          print(out)
+          pathlib.Path('${{ runner.temp }}/summary.md').write_text(out)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fetch-validation-summary
+          path: ${{ runner.temp }}/summary.md
+          retention-days: 30
