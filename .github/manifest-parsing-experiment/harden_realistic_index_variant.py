@@ -13,33 +13,56 @@ subprocess.run(
 path_rs = root / "src/sources/path.rs"
 s = path_rs.read_text()
 
-# Treat the sidecar as a complete snapshot and an optimization only. A torn or
-# malformed index must never become a partial source of truth. The footer count
-# lets a valid snapshot answer a missing package name authoritatively without
-# falling back to a full recursive scan.
-old_loader = '''            if self.manifest_index.borrow().is_none() {
-                let index_path = self.path.join(".cargo-manifest-index-experiment");
-                if let Ok(contents) = fs::read_to_string(&index_path) {
-                    let mut index = HashMap::<String, Vec<PathBuf>>::default();
-                    for line in contents.lines() {
-                        let Some((name, rel)) = line.split_once('\\t') else {
-                            continue;
-                        };
-                        if name.is_empty() || rel.is_empty() {
-                            continue;
-                        }
-                        index
-                            .entry(name.to_owned())
-                            .or_default()
-                            .push(PathBuf::from(rel));
-                    }
-                    if !index.is_empty() {
-                        self.manifest_index.replace(Some(index));
-                    }
-                }
-            }
+# The warm index is a complete snapshot produced by Cargo's existing full
+# discovery. Track names already materialized in this process separately from
+# paths visited while expanding nested path dependencies. Without this, a
+# repeated query sees an empty `discovered` map and incorrectly falls back to a
+# full recursive scan.
+old_fields = '''    /// Paths already parsed through the warm index, including nested path deps.
+    indexed_visited: RefCell<HashSet<PathBuf>>,
+    gctx: &'gctx GlobalContext,
+}'''
+new_fields = '''    /// Paths already parsed through the warm index, including nested path deps.
+    indexed_visited: RefCell<HashSet<PathBuf>>,
+    /// Package names whose complete candidate set has already been materialized.
+    indexed_materialized_names: RefCell<HashSet<String>>,
+    gctx: &'gctx GlobalContext,
+}'''
+assert old_fields in s, "warm index fields changed"
+s = s.replace(old_fields, new_fields, 1)
+
+old_new = '''            manifest_index: Default::default(),
+            indexed_visited: Default::default(),
+            gctx,
 '''
-new_loader = '''            if self.manifest_index.borrow().is_none() {
+new_new = '''            manifest_index: Default::default(),
+            indexed_visited: Default::default(),
+            indexed_materialized_names: Default::default(),
+            gctx,
+'''
+assert old_new in s, "warm index constructor changed"
+s = s.replace(old_new, new_new, 1)
+
+# Replace the entire experimental query fast path. The important state machine
+# is: complete negative hit -> return; already materialized -> reuse packages;
+# first positive hit -> parse every candidate for that name and mark every name
+# discovered through nested path deps; bad candidate/index -> current full scan.
+query_anchor = "impl<'gctx> Source for RecursivePathSource<'gctx> {"
+qpos = s.index(query_anchor)
+warm_start = s.index(
+    '''        if !self.loaded.get()
+            && self.source_id.is_git()
+            && std::env::var_os("CARGO_GIT_MANIFEST_INDEX_USE").is_some()
+        {''',
+    qpos,
+)
+full_load = s.index("        self.load()?;\n", warm_start)
+
+new_warm = r'''        if !self.loaded.get()
+            && self.source_id.is_git()
+            && std::env::var_os("CARGO_GIT_MANIFEST_INDEX_USE").is_some()
+        {
+            if self.manifest_index.borrow().is_none() {
                 let index_path = self.path.join(".cargo-manifest-index-experiment");
                 if let Ok(contents) = fs::read_to_string(&index_path) {
                     let lines = contents.lines().collect::<Vec<_>>();
@@ -51,14 +74,14 @@ new_loader = '''            if self.manifest_index.borrow().is_none() {
                         } else {
                             let body = &lines[1..lines.len() - 1];
                             let expected_entries = lines[lines.len() - 1]
-                                .strip_prefix("cargo-manifest-index-end\\t")
+                                .strip_prefix("cargo-manifest-index-end\t")
                                 .and_then(|value| value.parse::<usize>().ok());
                             if expected_entries != Some(body.len()) {
                                 valid = false;
                             }
                             if valid {
                                 for line in body {
-                                    let Some((name, rel)) = line.split_once('\\t') else {
+                                    let Some((name, rel)) = line.split_once('\t') else {
                                         valid = false;
                                         break;
                                     };
@@ -86,72 +109,36 @@ new_loader = '''            if self.manifest_index.borrow().is_none() {
                         }
                     }
                     if valid {
+                        if std::env::var_os("CARGO_GIT_MANIFEST_INDEX_STATS").is_some() {
+                            eprintln!(
+                                "cargo-manifest-index index_load path={} names={}",
+                                index_path.display(),
+                                index.len(),
+                            );
+                        }
                         self.manifest_index.replace(Some(index));
+                    } else if std::env::var_os("CARGO_GIT_MANIFEST_INDEX_STATS").is_some() {
+                        eprintln!(
+                            "cargo-manifest-index invalid_index path={}",
+                            index_path.display(),
+                        );
                     }
                 }
             }
-'''
-assert old_loader in s, "warm index loader shape changed"
-s = s.replace(old_loader, new_loader, 1)
 
-# A validated complete snapshot can answer a negative lookup. This is crucial:
-# dependency resolution probes names that do not exist in a particular git
-# source. Treating every miss as cache corruption collapses back to eager load.
-old_lookup = '''            if let Some(candidates) = candidates {
-                let candidates = candidates.unwrap_or_default();
-'''
-new_lookup = '''            if let Some(candidates) = candidates {
-                let Some(candidates) = candidates else {
-                    return Ok(());
-                };
-'''
-assert old_lookup in s, "warm index lookup shape changed"
-s = s.replace(old_lookup, new_lookup, 1)
+            let package_name = dep.package_name().to_string();
 
-# If an indexed name points at a missing path, or no longer materializes a
-# package with that name, abandon the index and fall back to the existing full
-# discovery path. Do not let a bad cache change resolution semantics.
-old_candidates = '''                let mut discovered = HashMap::default();
-                let mut errors = Vec::<anyhow::Error>::new();
-                let before = self.indexed_visited.borrow().len();
-                {
-                    let mut visited = self.indexed_visited.borrow_mut();
-                    for rel in &candidates {
-                        let dir = if rel == Path::new(".") {
-                            self.path.clone()
-                        } else {
-                            self.path.join(rel)
-                        };
-                        if has_manifest(&dir) {
-                            read_nested_packages(
-                                &dir,
-                                &mut discovered,
-                                self.source_id,
-                                self.gctx,
-                                &mut visited,
-                                &mut errors,
-                            )?;
-                        }
-                    }
-                }
-
-                if !discovered.is_empty() {
-                    let mut packages = self.packages.borrow_mut();
-                    for (pkg_id, mut found) in discovered {
-                        packages.entry(pkg_id).or_default().append(&mut found);
-                    }
-                }
-
+            if self
+                .indexed_materialized_names
+                .borrow()
+                .contains(&package_name)
+            {
                 if std::env::var_os("CARGO_GIT_MANIFEST_INDEX_STATS").is_some() {
                     eprintln!(
-                        "cargo-manifest-index query={} candidates={} newly_parsed={} total_parsed={}",
+                        "cargo-manifest-index repeat_materialized_hit query={}",
                         package_name,
-                        candidates.len(),
-                        self.indexed_visited.borrow().len().saturating_sub(before),
-                        self.indexed_visited.borrow().len(),
                     );
                 }
-
                 for s in self
                     .packages
                     .borrow()
@@ -177,8 +164,26 @@ old_candidates = '''                let mut discovered = HashMap::default();
                     }
                 }
                 return Ok(());
-'''
-new_candidates = '''                let mut discovered = HashMap::default();
+            }
+
+            let candidates = self
+                .manifest_index
+                .borrow()
+                .as_ref()
+                .map(|index| index.get(&package_name).cloned());
+
+            if let Some(candidates) = candidates {
+                let Some(candidates) = candidates else {
+                    if std::env::var_os("CARGO_GIT_MANIFEST_INDEX_STATS").is_some() {
+                        eprintln!(
+                            "cargo-manifest-index negative_hit query={}",
+                            package_name,
+                        );
+                    }
+                    return Ok(());
+                };
+
+                let mut discovered = HashMap::default();
                 let mut errors = Vec::<anyhow::Error>::new();
                 let before = self.indexed_visited.borrow().len();
                 let mut index_entry_valid = !candidates.is_empty();
@@ -205,10 +210,12 @@ new_candidates = '''                let mut discovered = HashMap::default();
                     }
                 }
 
+                let discovered_names = discovered
+                    .keys()
+                    .map(|pkg_id| pkg_id.name().to_string())
+                    .collect::<Vec<_>>();
                 if index_entry_valid
-                    && !discovered
-                        .keys()
-                        .any(|pkg_id| pkg_id.name() == dep.package_name())
+                    && !discovered_names.iter().any(|name| name == &package_name)
                 {
                     index_entry_valid = false;
                 }
@@ -220,10 +227,16 @@ new_candidates = '''                let mut discovered = HashMap::default();
                             packages.entry(pkg_id).or_default().append(&mut found);
                         }
                     }
+                    {
+                        let mut materialized = self.indexed_materialized_names.borrow_mut();
+                        for name in discovered_names {
+                            materialized.insert(name);
+                        }
+                    }
 
                     if std::env::var_os("CARGO_GIT_MANIFEST_INDEX_STATS").is_some() {
                         eprintln!(
-                            "cargo-manifest-index query={} candidates={} newly_parsed={} total_parsed={}",
+                            "cargo-manifest-index candidate_hit query={} candidates={} newly_parsed={} total_parsed={}",
                             package_name,
                             candidates.len(),
                             self.indexed_visited.borrow().len().saturating_sub(before),
@@ -258,36 +271,69 @@ new_candidates = '''                let mut discovered = HashMap::default();
                     return Ok(());
                 }
 
+                if std::env::var_os("CARGO_GIT_MANIFEST_INDEX_STATS").is_some() {
+                    eprintln!(
+                        "cargo-manifest-index fallback_bad_candidate query={}",
+                        package_name,
+                    );
+                }
                 self.manifest_index.replace(None);
                 self.indexed_visited.borrow_mut().clear();
-'''
-assert old_candidates in s, "warm index candidate path changed"
-s = s.replace(old_candidates, new_candidates, 1)
+                self.indexed_materialized_names.borrow_mut().clear();
+            }
+        }
 
-# Preserve duplicate PackageId ordering from the authoritative full discovery.
-# Sort package-id groups for deterministic output, but never sort paths inside a
-# duplicate group. Publish an explicitly complete snapshot via temp + rename.
-old_writer = '''            let mut lines = Vec::new();
-            for (pkg_id, packages) in &all_packages {
-                for pkg in packages {
-                    if let Ok(rel) = pkg.root().strip_prefix(path) {
-                        let rel = if rel.as_os_str().is_empty() {
-                            ".".to_owned()
-                        } else {
-                            rel.to_string_lossy().into_owned()
-                        };
-                        lines.push(format!("{}\\t{}", pkg_id.name(), rel));
-                    }
-                }
-            }
-            lines.sort();
-            lines.dedup();
-            let index_path = path.join(".cargo-manifest-index-experiment");
-            if let Err(err) = fs::write(&index_path, lines.join("\\n") + "\\n") {
-                warn!("failed to write manifest index {}: {}", index_path.display(), err);
-            }
 '''
-new_writer = '''            let mut groups = Vec::<(String, String, Vec<String>)>::new();
+s = s[:warm_start] + new_warm + s[full_load:]
+
+# Make unexpected escalation to the authoritative O(N) source walk directly
+# observable in diagnostic runs. This is intentionally behind the stats env var
+# so it cannot affect timed measurements.
+old_load = '''    pub fn load(&self) -> CargoResult<()> {
+        if !self.loaded.get() {
+            self.packages
+                .replace(read_packages(&self.path, self.source_id, self.gctx)?);
+            self.loaded.set(true);
+        }
+
+        Ok(())
+    }
+'''
+new_load = '''    pub fn load(&self) -> CargoResult<()> {
+        if !self.loaded.get() {
+            if self.source_id.is_git()
+                && std::env::var_os("CARGO_GIT_MANIFEST_INDEX_USE").is_some()
+                && std::env::var_os("CARGO_GIT_MANIFEST_INDEX_STATS").is_some()
+            {
+                eprintln!(
+                    "cargo-manifest-index full_recursive_load path={}",
+                    self.path.display(),
+                );
+            }
+            self.packages
+                .replace(read_packages(&self.path, self.source_id, self.gctx)?);
+            self.loaded.set(true);
+        }
+
+        Ok(())
+    }
+'''
+assert old_load in s, "recursive load shape changed"
+s = s.replace(old_load, new_load, 1)
+
+# Replace the simple writer inserted by the base experiment with a complete,
+# versioned snapshot. Preserve duplicate PackageId ordering within each group
+# and publish atomically with a per-process temporary file.
+writer_start = s.index(
+    '''        if source_id.is_git()
+            && std::env::var_os("CARGO_GIT_MANIFEST_INDEX_BUILD").is_some()
+        {'''
+)
+writer_end = s.index("        Ok(all_packages)\n", writer_start)
+new_writer = r'''        if source_id.is_git()
+            && std::env::var_os("CARGO_GIT_MANIFEST_INDEX_BUILD").is_some()
+        {
+            let mut groups = Vec::<(String, String, Vec<String>)>::new();
             for (pkg_id, packages) in &all_packages {
                 let mut rels = Vec::new();
                 for pkg in packages {
@@ -309,12 +355,12 @@ new_writer = '''            let mut groups = Vec::<(String, String, Vec<String>)
             let mut lines = vec!["cargo-manifest-index-v2".to_owned()];
             for (_, name, rels) in groups {
                 for rel in rels {
-                    lines.push(format!("{}\\t{}", name, rel));
+                    lines.push(format!("{}\t{}", name, rel));
                 }
             }
             let entry_count = lines.len() - 1;
-            lines.push(format!("cargo-manifest-index-end\\t{}", entry_count));
-            let contents = lines.join("\\n") + "\\n";
+            lines.push(format!("cargo-manifest-index-end\t{}", entry_count));
+            let contents = lines.join("\n") + "\n";
             let index_path = path.join(".cargo-manifest-index-experiment");
             let temp_path = path.join(format!(
                 ".cargo-manifest-index-experiment.tmp-{}",
@@ -340,9 +386,9 @@ new_writer = '''            let mut groups = Vec::<(String, String, Vec<String>)
                     err
                 ),
             }
+        }
 '''
-assert old_writer in s, "warm index writer shape changed"
-s = s.replace(old_writer, new_writer, 1)
+s = s[:writer_start] + new_writer + s[writer_end:]
 
 path_rs.write_text(s)
-print("hardened realistic warm git manifest index variant v2")
+print("hardened realistic warm git manifest index variant v3")
